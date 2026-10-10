@@ -49,6 +49,7 @@ _VECTOR_NAME = os.environ.get("LOCI_RECALL_VECTOR_NAME", "dense")
 _MAX_CONTENT_CHARS = int(os.environ.get("LOCI_RECALL_MAX_CHARS", "200"))
 _EMBED_TIMEOUT = float(os.environ.get("LOCI_EMBED_TIMEOUT", "3.0"))
 _QDRANT_TIMEOUT = float(os.environ.get("LOCI_QDRANT_TIMEOUT", "2.0"))
+_INVESTIGATION_BOOST = float(os.environ.get("LOCI_INVESTIGATION_BOOST", "1.5"))
 _WORKERS = int(os.environ.get("LOCI_QDRANT_WORKERS", "8"))
 
 # Must sum to 1.0
@@ -284,6 +285,58 @@ class LociGroundingHook(CustomLogger):
             })
         return hits
 
+    async def _search_investigation(
+        self,
+        client: httpx.AsyncClient,
+        vector: list[float],
+        investigation_id: str,
+        top_k: int = 5,
+    ) -> list[dict]:
+        qdrant_url = self._resolver.qdrant_url()
+        if not qdrant_url:
+            return []
+
+        url = f"{qdrant_url.rstrip('/')}/collections/loci_memory/points/search"
+        headers = {"Content-Type": "application/json"}
+        api_key = self._resolver.qdrant_api_key()
+        if api_key:
+            headers["api-key"] = api_key
+
+        body = {
+            "vector": {"name": _VECTOR_NAME, "vector": vector},
+            "limit": top_k,
+            "with_payload": True,
+            "with_vector": False,
+            "filter": {
+                "must": [{"key": "investigation_id", "match": {"value": investigation_id}}],
+            },
+        }
+
+        resp = await client.post(url, json=body, headers=headers)
+        resp.raise_for_status()
+        d = resp.json()
+
+        hits = []
+        for pt in d.get("result", []):
+            score = pt.get("score", 0.0)
+            if score < _MIN_SCORE:
+                continue
+            payload = pt.get("payload") or {}
+            content = payload.get("text") or payload.get("content") or payload.get("content_preview") or ""
+            if not content:
+                continue
+            importance = float(payload.get("importance", 0.5) or 0.5)
+            hits.append({
+                "collection": "loci_memory",
+                "point_id": pt.get("id"),
+                "score": score,
+                "importance": importance,
+                "fused": score * importance,
+                "content": str(content),
+                "payload": payload,
+            })
+        return hits
+
     # ── Core grounding flow ─────────────────────────────────────────────────
 
     async def _ground(self, intent: str) -> str:
@@ -307,6 +360,11 @@ class LociGroundingHook(CustomLogger):
 
         async with httpx.AsyncClient(timeout=_QDRANT_TIMEOUT) as client:
             tasks = []
+            investigation_id = os.environ.get("LOCI_INVESTIGATION_ID", "").strip()
+            investigation_task_index = None
+            if investigation_id:
+                investigation_task_index = len(tasks)
+                tasks.append(self._search_investigation(client, vector, investigation_id, _RECALL_TOP_K))
             for col, cf, impf, named in COLLECTIONS:
                 tasks.append(
                     self._search_collection(
@@ -316,11 +374,18 @@ class LociGroundingHook(CustomLogger):
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         searched = len(results)
-        for r in results:
-            if isinstance(r, Exception):
+        for index, result in enumerate(results):
+            if isinstance(result, Exception):
                 failed += 1
-            elif isinstance(r, list):
-                all_hits.extend(r)
+                continue
+            if not isinstance(result, list):
+                continue
+            if index == investigation_task_index:
+                for hit in result:
+                    hit["fused"] = hit.get("fused", 0.0) * _INVESTIGATION_BOOST
+                all_hits.extend(result)
+                continue
+            all_hits.extend(result)
 
         if not all_hits:
             return ""

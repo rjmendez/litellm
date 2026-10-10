@@ -32,9 +32,12 @@ from litellm.integrations.loci.grounding_hook import (
     loci_grounding_hook,
 )
 from litellm.integrations.loci.backend_resolver import BackendResolver
+from litellm.integrations.loci.memory_writer import LociMemoryWriter, loci_memory_writer
 
 __all__ = [
     "LociGroundingHook",
     "loci_grounding_hook",
     "BackendResolver",
+    "LociMemoryWriter",
+    "loci_memory_writer",
 ]
