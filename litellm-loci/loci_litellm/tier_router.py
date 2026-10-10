@@ -156,9 +156,7 @@ class LociTierRouter(CustomLogger):
 
     def __init__(self) -> None:
         super().__init__()
-        self._providers: dict[str, ProviderHealth] = defaultdict(
-            lambda: ProviderHealth("unknown")
-        )
+        self._providers: dict[str, ProviderHealth] = {}
         self._lock = threading.RLock()
 
     def _provider_name(self, data: dict, response: Any = None) -> str:
@@ -187,7 +185,7 @@ class LociTierRouter(CustomLogger):
         provider = self._provider_name(data)
 
         with self._lock:
-            health = self._providers[provider]
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
 
         if not health.can_proceed():
             # Log but don't block — let LiteLLM's router handle fallback
@@ -212,7 +210,7 @@ class LociTierRouter(CustomLogger):
         """Record success on the provider."""
         provider = self._provider_name(kwargs)
         with self._lock:
-            health = self._providers[provider]
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
         health.record_success()
 
     async def async_log_failure_event(
@@ -232,9 +230,7 @@ class LociTierRouter(CustomLogger):
             is_transient = _is_transient(exc)
 
         with self._lock:
-            health = self._providers[provider]
-
-        # Only count transient errors toward circuit breaker — permanent
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
         # errors (auth, model not found) are config issues, not provider health
         if is_transient:
             health.record_failure()
