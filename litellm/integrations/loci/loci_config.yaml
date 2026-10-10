@@ -1,0 +1,31 @@
+# Loci integration config for LiteLLM proxy
+#
+# Copy this section into your litellm config.yaml under litellm_settings:
+#
+# litellm_settings:
+#   callbacks:
+#     - litellm.integrations.loci.grounding_hook.loci_grounding_hook
+#     - litellm.integrations.loci.tier_router.loci_tier_router
+#
+# Environment variables (all optional — sensible defaults, fail-open if unset):
+#
+#   LOCI_QDRANT_URL          — Qdrant endpoint (e.g. http://localhost:6333)
+#   LOCI_QDRANT_API_KEY       — Qdrant API key (if auth is enabled)
+#   LOCI_OLLAMA_BASE_URL      — Ollama host (e.g. http://localhost:11434)
+#   LOCI_EMBED_MODEL          — Embedding model (default: nomic-embed-text)
+#   LOCI_GROUNDING_EXTRA_COLLECTIONS — Comma-separated extra Qdrant collections
+#
+#   LOCI_RECALL_TOP_K         — Max grounding results (default: 3)
+#   LOCI_RECALL_MIN_SCORE     — Min Qdrant cosine score (default: 0.55)
+#   LOCI_RECALL_MIN_IMPORTANCE — Min importance weight (default: 0.2)
+#
+#   LOCI_CB_FAILURE_THRESHOLD — Circuit breaker failure count (default: 5)
+#   LOCI_CB_RECOVERY_WINDOW   — Failure window in seconds (default: 60)
+#
+#   LOCI_GROUNDING_DISABLED   — Set to "1" to disable grounding (default: unset)
+#
+# Backend resolution chain (per Loci's backends.py):
+#   1. Environment variable (highest priority)
+#   2. Local probe (localhost:11434 for Ollama, etc.)
+#   3. ~/.loci/backends.toml (gitignored, machine-specific)
+#   4. Safe default / empty (fail-open)
