@@ -159,27 +159,17 @@ class LociTierRouter(CustomLogger):
         self._providers: dict[str, ProviderHealth] = {}
         self._lock = threading.RLock()
 
-    def _provider_name(self, data: dict, response: Any = None) -> str:
-        """Extract the provider name from request/response data."""
-        # Try model_info first
-        model_info = data.get("model_info") or {}
-        litellm_params = data.get("litellm_params") or {}
-        model = litellm_params.get("model", "") or data.get("model", "")
-
-        if model:
-            # "ollama/qwen2.5:3b" -> "ollama"
-            parts = model.split("/", 1)
-            if len(parts) > 1:
-                return parts[0]
-            return model
-        if response is not None:
-            response_model = getattr(response, "model", "") or ""
-            if isinstance(response_model, str) and response_model:
-                response_parts = response_model.split("/", 1)
-                if len(response_parts) > 1:
-                    return response_parts[0]
-                return response_model
-        return "unknown"
+    @staticmethod
+    def _circuit_key(payload: dict) -> str:
+        litellm_params = payload.get("litellm_params") or {}
+        for metadata in (litellm_params.get("metadata"), payload.get("metadata")):
+            if not isinstance(metadata, dict):
+                continue
+            group = metadata.get("model_group")
+            if isinstance(group, str) and group:
+                return group
+        model = payload.get("model")
+        return model if isinstance(model, str) and model else "unknown"
 
     async def async_pre_call_hook(
         self,
@@ -189,7 +179,7 @@ class LociTierRouter(CustomLogger):
         call_type: Any,
     ) -> Exception | str | dict | None:
         """Check circuit state before the call. Advisory only — does not block."""
-        provider = self._provider_name(data)
+        provider = self._circuit_key(data)
         if provider == "unknown":
             return None
 
@@ -217,7 +207,7 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record success on the provider."""
-        provider = self._provider_name(kwargs, response_obj)
+        provider = self._circuit_key(kwargs)
         if provider == "unknown":
             return
         with self._lock:
@@ -232,7 +222,7 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record failure on the provider, classify transient vs permanent."""
-        provider = self._provider_name(kwargs)
+        provider = self._circuit_key(kwargs)
         if provider == "unknown":
             return
 
