@@ -31,6 +31,7 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -103,6 +104,13 @@ _NAVIGATION_SLASH_COMMANDS = frozenset({
 })
 
 
+@dataclass(frozen=True, slots=True)
+class GroundingOutcome:
+    status: str
+    context: str = ""
+    reason: str = ""
+
+
 class LociGroundingHook(CustomLogger):
     """
     LiteLLM CustomLogger that grounds each chat/completion request against
@@ -112,9 +120,9 @@ class LociGroundingHook(CustomLogger):
     unchanged. Grounding is best-effort and never blocks the proxy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, resolver: Any = BackendResolver) -> None:
         super().__init__()
-        self._resolver = BackendResolver
+        self._resolver = resolver
 
     # ── Main hook: async_pre_call_hook ──────────────────────────────────────
 
@@ -149,15 +157,18 @@ class LociGroundingHook(CustomLogger):
             return None
 
         try:
-            grounding_context = await self._ground(intent)
+            outcome = await self._ground(intent)
         except Exception as exc:
-            logger.debug("loci grounding: fail-open on error: %r", exc)
-            return None
+            logger.warning("loci grounding: fail-open error, request continues without retrieved context, error=%r", exc)
+            self._mark_grounding_failure(data, "error", type(exc).__name__)
+            return data
 
-        if not grounding_context:
-            return None
+        self._record_grounding_metadata(data, outcome.status, outcome.reason)
+        if outcome.status != "grounded":
+            self._inject_failure_notice(data, outcome.status, outcome.reason)
+            return data
 
-        self._inject_context(data, grounding_context)
+        self._inject_context(data, outcome.context)
         return data
 
     # ── Intent extraction ────────────────────────────────────────────────────
@@ -339,20 +350,20 @@ class LociGroundingHook(CustomLogger):
 
     # ── Core grounding flow ─────────────────────────────────────────────────
 
-    async def _ground(self, intent: str) -> str:
+    async def _ground(self, intent: str) -> GroundingOutcome:
         """
         Embed the intent, fan out to Qdrant, rank, and return the
         MEMORY MATCH context block. Returns empty string if nothing found.
         """
         qdrant_url = self._resolver.qdrant_url()
         if not qdrant_url:
-            logger.debug("loci grounding: QDRANT_URL not configured, skipping")
-            return ""
+            logger.warning("loci grounding: fail-open, request continues without retrieved context, reason=qdrant_unconfigured")
+            return GroundingOutcome(status="unavailable", reason="qdrant_unconfigured")
 
         vector = await self._embed(intent)
         if vector is None:
-            logger.debug("loci grounding: embedding failed, skipping (fail-open)")
-            return ""
+            logger.warning("loci grounding: fail-open, request continues without retrieved context, reason=embedding_failed")
+            return GroundingOutcome(status="unavailable", reason="embedding_failed")
 
         # Parallel fan-out across all collections
         all_hits: list[dict] = []
@@ -388,7 +399,8 @@ class LociGroundingHook(CustomLogger):
             all_hits.extend(result)
 
         if not all_hits:
-            return ""
+            logger.warning("loci grounding: no matching context found for request")
+            return GroundingOutcome(status="miss", reason="no_matching_context")
 
         # Keyword rerank
         all_hits = self._keyword_rerank(all_hits, intent)
@@ -413,7 +425,11 @@ class LociGroundingHook(CustomLogger):
                 except Exception:
                     pass
 
-        return self._format_results(hits, intent, failed, searched)
+        context = self._format_results(hits, intent, failed, searched)
+        if not context:
+            logger.warning("loci grounding: no matching context found for request")
+            return GroundingOutcome(status="miss", reason="no_matching_context")
+        return GroundingOutcome(status="grounded", context=context)
 
     # ── Ranking helpers ──────────────────────────────────────────────────────
 
@@ -618,6 +634,39 @@ class LociGroundingHook(CustomLogger):
             "content": context,
         }
         messages.insert(0, grounding_msg)
+        data["messages"] = messages
+
+    @staticmethod
+    def _record_grounding_metadata(data: dict, status: str, reason: str = "") -> None:
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["loci_grounding_status"] = status
+        if reason:
+            metadata["loci_grounding_reason"] = reason
+        data["metadata"] = metadata
+
+    def _mark_grounding_failure(self, data: dict, status: str, reason: str) -> None:
+        self._record_grounding_metadata(data, status, reason)
+        self._inject_failure_notice(data, status, reason)
+
+    @staticmethod
+    def _inject_failure_notice(data: dict, status: str, reason: str) -> None:
+        messages = data.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
+            data["messages"] = messages
+
+        reason_text = reason.replace("_", " ").strip() if reason else "unknown reason"
+        notice = {
+            "role": "system",
+            "content": (
+                f"LOCI_GROUNDING_STATUS: {status}. "
+                f"Grounding did not add retrieved context for this request because {reason_text}. "
+                "Proceed without retrieved memory context."
+            ),
+        }
+        messages.insert(0, notice)
         data["messages"] = messages
 
 
