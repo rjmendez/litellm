@@ -62,6 +62,20 @@ def _response(text: str) -> SimpleNamespace:
     )
 
 
+def _reasoning_only_response(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    reasoning_content=text,
+                    provider_specific_fields={"reasoning": text},
+                )
+            )
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_stores_qa_pair_to_qdrant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOCI_OLLAMA_BASE_URL", "http://ollama.local")
@@ -87,7 +101,9 @@ async def test_stores_qa_pair_to_qdrant(monkeypatch: pytest.MonkeyPatch) -> None
 
     qdrant_calls = [call for call in client.calls if call["method"] == "PUT"]
     assert len(qdrant_calls) == 1
-    payload = qdrant_calls[0]["kwargs"]["json"]["points"][0]["payload"]
+    point = qdrant_calls[0]["kwargs"]["json"]["points"][0]
+    payload = point["payload"]
+    assert point["vector"]["dense"] == [0.1] * 768
     assert prompt[:300] in payload["text"]
     assert response[:500] in payload["text"]
 
@@ -203,3 +219,26 @@ async def test_investigation_id_in_payload(monkeypatch: pytest.MonkeyPatch) -> N
     assert qdrant_calls
     payload = qdrant_calls[0]["kwargs"]["json"]["points"][0]["payload"]
     assert payload["investigation_id"] == "inv-42"
+
+
+@pytest.mark.asyncio
+async def test_stores_reasoning_only_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCI_OLLAMA_BASE_URL", "http://ollama.local")
+    monkeypatch.setenv("LOCI_QDRANT_URL", "http://qdrant.local")
+    monkeypatch.setenv("LOCI_MEM_MIN_PROMPT_LEN", "20")
+    client = FakeAsyncClient()
+    writer = LociMemoryWriter(_http_client_factory=lambda: client)
+    prompt = "This prompt is long enough to verify reasoning-only provider responses are still stored."
+    reasoning = "The provider returned reasoning text without a content field, but the writer should still persist it."
+
+    await writer.async_log_success_event(
+        {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]},
+        _reasoning_only_response(reasoning),
+        0.0,
+        0.0,
+    )
+
+    qdrant_calls = [call for call in client.calls if call["method"] == "PUT"]
+    assert len(qdrant_calls) == 1
+    payload = qdrant_calls[0]["kwargs"]["json"]["points"][0]["payload"]
+    assert reasoning[:500] in payload["text"]

@@ -172,6 +172,13 @@ class LociTierRouter(CustomLogger):
             if len(parts) > 1:
                 return parts[0]
             return model
+        if response is not None:
+            response_model = getattr(response, "model", "") or ""
+            if isinstance(response_model, str) and response_model:
+                response_parts = response_model.split("/", 1)
+                if len(response_parts) > 1:
+                    return response_parts[0]
+                return response_model
         return "unknown"
 
     async def async_pre_call_hook(
@@ -183,6 +190,8 @@ class LociTierRouter(CustomLogger):
     ) -> Exception | str | dict | None:
         """Check circuit state before the call. Advisory only — does not block."""
         provider = self._provider_name(data)
+        if provider == "unknown":
+            return None
 
         with self._lock:
             health = self._providers.setdefault(provider, ProviderHealth(provider))
@@ -208,7 +217,9 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record success on the provider."""
-        provider = self._provider_name(kwargs)
+        provider = self._provider_name(kwargs, response_obj)
+        if provider == "unknown":
+            return
         with self._lock:
             health = self._providers.setdefault(provider, ProviderHealth(provider))
         health.record_success()
@@ -222,6 +233,8 @@ class LociTierRouter(CustomLogger):
     ) -> None:
         """Record failure on the provider, classify transient vs permanent."""
         provider = self._provider_name(kwargs)
+        if provider == "unknown":
+            return
 
         # Extract the original exception
         exc = kwargs.get("original_exception") or kwargs.get("exception")

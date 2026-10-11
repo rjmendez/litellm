@@ -72,7 +72,9 @@ class LociMemoryWriter(CustomLogger):
             message: Any = choices[0].message
             content: Any = getattr(message, "content", "") or ""
             if isinstance(content, str):
-                return content.strip()
+                stripped = content.strip()
+                if stripped:
+                    return stripped
             if isinstance(content, list):
                 bits: list[str] = []
                 for part in content:
@@ -81,7 +83,19 @@ class LociMemoryWriter(CustomLogger):
                     text: Any = part.get("text") or ""
                     if isinstance(text, str) and text.strip():
                         bits.append(text.strip())
-                return " ".join(bits).strip()
+                joined = " ".join(bits).strip()
+                if joined:
+                    return joined
+            reasoning_content: Any = getattr(message, "reasoning_content", "") or ""
+            if isinstance(reasoning_content, str):
+                stripped_reasoning = reasoning_content.strip()
+                if stripped_reasoning:
+                    return stripped_reasoning
+            provider_specific_fields: Any = getattr(message, "provider_specific_fields", None) or {}
+            if isinstance(provider_specific_fields, dict):
+                reasoning: Any = provider_specific_fields.get("reasoning") or ""
+                if isinstance(reasoning, str):
+                    return reasoning.strip()
         except Exception:
             return ""
         return ""
@@ -133,7 +147,11 @@ class LociMemoryWriter(CustomLogger):
 
         body: dict[str, Any] = {
             "points": [
-                {"id": point_id, "vector": vector, "payload": payload},
+                {
+                    "id": point_id,
+                    "vector": {os.environ.get("LOCI_MEMORY_VECTOR_NAME", "dense"): vector},
+                    "payload": payload,
+                },
             ]
         }
         timeout: float = float(os.environ.get("LOCI_MEM_QDRANT_TIMEOUT", "2.0"))
