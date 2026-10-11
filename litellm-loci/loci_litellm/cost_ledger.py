@@ -53,6 +53,14 @@ def _is_local(api_base: str) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def _is_local_deployment(provider: str, model: str, api_base: str) -> bool:
+    """Ollama is local compute by definition, whatever name its door has (a private TLS name, a proxy);
+    anything else is local only when its host is a loopback or private address."""
+    if (provider or "").lower().startswith("ollama") or (model or "").lower().startswith(("ollama/", "ollama_chat/")):
+        return True
+    return _is_local(api_base)
+
+
 def _num(value: Any) -> float:
     try:
         return float(value or 0)
@@ -92,7 +100,8 @@ class LociCostLedger(CustomLogger):
             "deployment": str(slo.get("model_id") or meta_params.get("model_id") or ""),
             "model": str(slo.get("model") or kwargs.get("model") or ""),
             "host": urlparse(api_base).hostname or "",
-            "local": _is_local(api_base),
+            "local": _is_local_deployment(str(slo.get("custom_llm_provider") or ""),
+                                          str(slo.get("model") or kwargs.get("model") or ""), api_base),
             "ok": bool(ok),
             "call_type": str(slo.get("call_type") or kwargs.get("call_type") or ""),
             "stream": bool(slo.get("stream") or kwargs.get("stream")),

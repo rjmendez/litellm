@@ -108,3 +108,11 @@ def test_report_withholds_the_recommendation_when_local_is_flaky_or_thin() -> No
     assert cost_report.summarise(flaky, {})["g"]["meets_slo"] is False
     thin = [_row("g", True) for _ in range(5)]
     assert "only 5 local calls" in cost_report.summarise(thin, {})["g"]["recommendation"]
+
+
+def test_an_ollama_deployment_is_local_even_behind_a_private_name() -> None:
+    row = LociCostLedger.build_row(_kwargs(api_base="https://ollama.lab.example.net:4443", model="ollama/resident"),
+                                   True, T0, T0)
+    assert row["local"] is True
+    cloud = LociCostLedger.build_row(_kwargs(api_base="https://gateway.example/v1", model="openai/anthropic/x"), True, T0, T0)
+    assert cloud["local"] is False
