@@ -7,7 +7,7 @@ LiteLLM proxy callbacks that read from and write to a Qdrant-backed memory store
 | grounding hook | `grounding_hook.loci_grounding_hook` | Before a call, retrieves matching records from Qdrant and puts them in the request's instruction slot. |
 | memory writer | `memory_writer.loci_memory_writer` | After a successful call, writes a prompt/answer preview into a Qdrant collection. |
 | tier router | `tier_router.loci_tier_router` | Counts transient failures per model group and logs when a circuit opens. Advisory: it does not change routing. |
-| cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it. |
+| cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it (offline: it does not need LiteLLM installed). |
 | capability gate | `capability_gate.loci_capability_gate` | Tags a request that carries tool definitions or tool turns with `!<local tag>` so the router can keep it off local deployments. Inert unless router tag filtering is on and the local deployments are tagged (see below). |
 
 `dedup_gate` was a semantic cache. It could not work (LiteLLM treats a dict returned from a pre-call hook as the
@@ -206,7 +206,13 @@ These change what existing deployments observe. Nothing here is applied until th
   (`all_collections_failed`), no longer `miss`. A miss with failed searches carries reason
   `no_matching_context_some_searches_failed`. An `importance` of 0 is kept as 0. The retrieved block is labelled
   as reference data, and the query line is flattened to one line.
-- **Cost ledger.** Rows are per attempt, not per request; `cost_report` counts are per attempt.
+- **Cost ledger.** Rows are per attempt, not per request; `cost_report` counts are per attempt. Rows gain
+  `cache_read_tokens`, `cache_write_tokens` (what the provider reported, 0 when it reports none) and
+  `empty_response` (a call that succeeded but returned no answer text and no tool call; a reasoning model that
+  spent its budget thinking counts). `cost_report` counts an empty answer as a failure for the local SLO and adds
+  `empty` and `cache%` columns; a ledger written before these fields reads as 0 cache and 0 empty.
+- **Package import.** `import loci_litellm` no longer imports the callbacks (and so LiteLLM); they load on first
+  attribute access. Code that did `from loci_litellm import loci_grounding_hook` is unaffected.
 - **Removed settings (set-but-ignored now).** `LOCI_DEDUP_*`, `LOCI_CB_RECOVERY_WINDOW`, `LOCI_QDRANT_WORKERS`,
   `LOCI_LOCAL_VLLM`, `LOCI_OLLAMA_LIST_TIMEOUT`, `LOCI_OLLAMA_GEN_URL` / `LOCI_OLLAMA_GEN_MODEL`,
   `LOCI_VLLM_*`, `LOCI_RERANK_MODEL`, and the `BackendResolver` methods `ollama_gen_url`, `vllm_url`,

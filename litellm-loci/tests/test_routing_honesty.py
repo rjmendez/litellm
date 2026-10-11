@@ -150,8 +150,8 @@ def test_row_fields_are_an_exact_allowlist() -> None:
     row = LociCostLedger.build_row(_kw(), True, T0, T0)
     assert set(row) == {
         "ts", "call_id", "trace_id", "group", "deployment", "model", "host", "local", "ok", "call_type",
-        "stream", "prompt_tokens", "completion_tokens", "cost_usd", "latency_s", "cache_hit", "error_class",
-        "internal", "grounding", "agent", "key_alias"}
+        "stream", "prompt_tokens", "completion_tokens", "cache_read_tokens", "cache_write_tokens", "empty_response",
+        "cost_usd", "latency_s", "cache_hit", "error_class", "internal", "grounding", "agent", "key_alias"}
 
 
 def test_unknown_latency_is_null_not_zero() -> None:

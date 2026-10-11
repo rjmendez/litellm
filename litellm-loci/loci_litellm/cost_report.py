@@ -17,6 +17,11 @@ What the numbers are:
     savings 0. It ignores the real input/output mix. A group with no priced deployment reports savings as null ("n/a"), not zero.
   - Latency percentiles (local_p50_s / local_p95_s) are over SUCCESSFUL local calls only; failed calls
     are excluded from them. Rows whose latency is null are skipped.
+  - ok% is the share of local calls that succeeded AND returned an answer: a call that succeeded but came
+    back empty (`empty_response`) counts as a failure for the SLO, because the caller got nothing. The
+    `empty` column is that count over all calls of the group, local and cloud.
+  - cache% is cache_read_tokens / prompt_tokens over the group's rows, as the provider reported them. A
+    ledger written before those fields existed reads as 0%. It is not a billing figure.
   - By default internal calls (judges, classifiers, embeddings flagged by the memory system) are
     included in every figure; --exclude-internal drops them. The mode is printed.
   - The SLO is LOCI_LOCAL_SLO_SUCCESS (default 0.98), LOCI_LOCAL_SLO_P95_S (default 20) and
@@ -110,7 +115,11 @@ def summarise(rows: Iterable[dict], prices: dict, include_internal: bool = True)
     for group, sides in groups.items():
         local_rows = [r for rs in sides["local"].values() for r in rs]
         cloud_rows = [r for rs in sides["cloud"].values() for r in rs]
-        local_ok = [r for r in local_rows if r.get("ok")]
+        local_ok = [r for r in local_rows if r.get("ok") and not r.get("empty_response")]
+        all_rows = local_rows + cloud_rows
+        prompt_total = sum(int(r.get("prompt_tokens") or 0) for r in all_rows)
+        cache_read = sum(int(r.get("cache_read_tokens") or 0) for r in all_rows)
+        cache_write = sum(int(r.get("cache_write_tokens") or 0) for r in all_rows)
         price = prices.get(group)
         if price is None:
             counterfactual: Optional[float] = None
@@ -141,6 +150,12 @@ def summarise(rows: Iterable[dict], prices: dict, include_internal: bool = True)
             "cloud_spend_usd": round(sum(r.get("cost_usd", 0.0) for r in cloud_rows), 6),
             "local_savings_usd": None if counterfactual is None else round(counterfactual, 6),
             "local_failures": sorted({r.get("error_class") or "?" for r in local_rows if not r.get("ok")}),
+            "empty_responses": sum(1 for r in all_rows if r.get("empty_response")),
+            "local_empty_responses": sum(1 for r in local_rows if r.get("empty_response")),
+            "prompt_tokens": prompt_total,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cache_read_share": None if not prompt_total else round(cache_read / prompt_total, 4),
             "meets_slo": meets,
             "recommendation": "local meets the SLO" if meets else "local does not meet the SLO: " + "; ".join(failing),
         }
@@ -156,7 +171,7 @@ def main(argv: list | None = None) -> int:
                     help="leave out calls the memory system flags as internal (judges, classifiers, embeddings)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    from loci_litellm.cost_ledger import ledger_path
+    from loci_litellm.backend_resolver import ledger_path   # LiteLLM-free: the report runs offline
     path = args.ledger or ledger_path()
     if not os.path.exists(path):
         print(f"no ledger at {path}", file=sys.stderr)
@@ -178,12 +193,14 @@ def main(argv: list | None = None) -> int:
     mode = "internal calls excluded" if args.exclude_internal else "internal calls included"
     print(f"ledger {path}: {stats.get('read', 0)} rows read, {mode}; latency over successful local calls only; "
           f"savings priced at the lowest-priced deployment per group")
-    print(f"{'group':16s} {'calls':>6s} {'local':>6s} {'ok%':>6s} {'p95s':>6s} {'cloud$':>9s} {'saved$':>9s}  verdict")
+    print(f"{'group':16s} {'calls':>6s} {'local':>6s} {'ok%':>6s} {'empty':>6s} {'cache%':>7s} {'p95s':>6s} "
+          f"{'cloud$':>9s} {'saved$':>9s}  verdict")
     for group, s in sorted(summary.items()):
         ok = "-" if s["local_success"] is None else f"{100 * s['local_success']:.1f}"
         saved = "n/a" if s["local_savings_usd"] is None else f"{s['local_savings_usd']:.4f}"
-        print(f"{group:16s} {s['calls']:6d} {s['local_calls']:6d} {ok:>6s} {s['local_p95_s']:6.1f} "
-              f"{s['cloud_spend_usd']:9.4f} {saved:>9s}  {s['recommendation']}")
+        cache = "-" if s["cache_read_share"] is None else f"{100 * s['cache_read_share']:.1f}"
+        print(f"{group:16s} {s['calls']:6d} {s['local_calls']:6d} {ok:>6s} {s['empty_responses']:6d} {cache:>7s} "
+              f"{s['local_p95_s']:6.1f} {s['cloud_spend_usd']:9.4f} {saved:>9s}  {s['recommendation']}")
     total_saved = sum(s["local_savings_usd"] or 0.0 for s in summary.values())
     total_spend = sum(s["cloud_spend_usd"] for s in summary.values())
     note = " (groups without a price excluded)" if unpriced else ""

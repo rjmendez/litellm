@@ -8,14 +8,21 @@ Coverage: only calls logged through LiteLLM's async callbacks are recorded (sync
 one row is written per ATTEMPT, not per client request: a router retry or fallback is its own LiteLLM call
 with its own logging object, so a request that fails twice and then succeeds is three rows (verified with a
 Router at num_retries=3 against an always-failing mock: 4 failure rows for 1 request). Call counts and the
-local success rate in cost_report are therefore per attempt. The callback records only once it is registered in the LiteLLM config
-(`litellm.integrations.loci.cost_ledger.loci_cost_ledger` or `loci_litellm.cost_ledger.loci_cost_ledger`);
-registered, it records unless LOCI_COST_LEDGER_DISABLED=1.
+local success rate in cost_report are therefore per attempt. The callback records only once it is
+registered in the LiteLLM config (`litellm.integrations.loci.cost_ledger.loci_cost_ledger` or
+`loci_litellm.cost_ledger.loci_cost_ledger`); registered, it records unless LOCI_COST_LEDGER_DISABLED=1.
 
 Row fields (the complete set, enforced by a test): ts, call_id, trace_id, group, deployment, model, host,
-local, ok, call_type, stream, prompt_tokens, completion_tokens, cost_usd, latency_s, cache_hit,
-error_class, internal, grounding, agent (first 60 chars of the User-Agent), key_alias. No prompt or
-response text is written. `agent` and `key_alias` identify callers, so treat the file as sensitive.
+local, ok, call_type, stream, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+empty_response, cost_usd, latency_s, cache_hit, error_class, internal, grounding, agent (first 60 chars of
+the User-Agent), key_alias. No prompt or response text is written. `agent` and `key_alias` identify
+callers, so treat the file as sensitive.
+
+`cache_read_tokens` / `cache_write_tokens` are the prompt tokens the provider reported as served from, or
+written to, its prompt cache (0 when it reports none; they are part of `prompt_tokens`, not extra). They
+are what the provider said, not a billing statement. `empty_response` is true only for a call that
+SUCCEEDED but produced no answer text and no tool call (a reasoning model that spent its whole budget
+thinking counts); it is false for embeddings and for any response shape this module does not recognise.
 
 `local` is an address-class heuristic on the deployment's api_base host, not a statement about where the
 model runs: loopback, link-local, private (RFC 1918 / ULA) and CGNAT 100.64.0.0/10 (Tailscale) addresses,
@@ -44,16 +51,11 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from litellm.integrations.custom_logger import CustomLogger
-from loci_litellm.backend_resolver import BackendResolver
+from loci_litellm.backend_resolver import BackendResolver, ledger_path  # noqa: F401  (re-exported)
 
 logger = logging.getLogger("loci_litellm.cost_ledger")
 
 _WRITE_LOCK = threading.Lock()
-
-
-def ledger_path() -> str:
-    explicit = os.environ.get("LOCI_COST_LEDGER_FILE") or BackendResolver.cost_ledger_file()
-    return str(explicit or (Path.home() / ".loci" / "litellm_cost_ledger.jsonl"))
 
 
 def _disabled() -> bool:
@@ -103,6 +105,67 @@ def _is_local_deployment(provider: str, model: str, api_base: str) -> bool:
     return _is_local(api_base)
 
 
+_COMPLETION_CALLS = ("completion", "text_completion", "acompletion", "atext_completion", "responses",
+                     "aresponses", "anthropic_messages", "generate_content", "agenerate_content")
+
+
+def _usage_of(response_obj: Any, slo: dict) -> Any:
+    usage = getattr(response_obj, "usage", None)
+    if usage is None and isinstance(response_obj, dict):
+        usage = response_obj.get("usage")
+    if usage is None:
+        resp = slo.get("response")
+        usage = resp.get("usage") if isinstance(resp, dict) else None
+    return usage
+
+
+def _field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _cache_tokens(response_obj: Any, slo: dict) -> tuple[int, int]:
+    """(cache_read, cache_write) prompt tokens as the provider reported them, 0 when it did not. Reads the
+    OpenAI-shaped prompt_tokens_details first, then the Anthropic-shaped usage fields LiteLLM keeps."""
+    usage = _usage_of(response_obj, slo)
+    if usage is None:
+        return 0, 0
+    details = _field(usage, "prompt_tokens_details")
+    read = _field(details, "cached_tokens") if details is not None else None
+    write = _field(details, "cache_write_tokens") if details is not None else None
+    if write is None and details is not None:
+        write = _field(details, "cache_creation_tokens")
+    if read is None:
+        read = _field(usage, "cache_read_input_tokens") or _field(usage, "_cache_read_input_tokens")
+    if write is None:
+        write = _field(usage, "cache_creation_input_tokens") or _field(usage, "_cache_creation_input_tokens")
+    return int(_num(read)), int(_num(write))
+
+
+def _is_empty_response(call_type: str, response_obj: Any, slo: dict) -> bool:
+    """True when a call that SUCCEEDED returned nothing usable: no answer text and no tool call. A reasoning
+    model that spent its whole token budget thinking is empty by this definition. False for call types
+    where an answer is not text (embeddings, images, audio) and whenever the response shape is unknown."""
+    if call_type not in _COMPLETION_CALLS or response_obj is None:
+        return False
+    choices = getattr(response_obj, "choices", None)
+    if choices is None and isinstance(response_obj, dict):
+        choices = response_obj.get("choices")
+    if not choices:
+        return False                      # not a chat-completion shape: do not guess
+    for choice in choices:
+        message = _field(choice, "message") or _field(choice, "delta")
+        text = _field(message, "content") if message is not None else None
+        if text is None:
+            text = _field(choice, "text")
+        if isinstance(text, list):
+            text = "".join(str(_field(part, "text") or "") for part in text)
+        if isinstance(text, str) and text.strip():
+            return False
+        if message is not None and (_field(message, "tool_calls") or _field(message, "function_call")):
+            return False
+    return True
+
+
 def _num(value: Any) -> float:
     try:
         return float(value or 0)
@@ -115,7 +178,8 @@ class LociCostLedger(CustomLogger):
         super().__init__()
 
     @staticmethod
-    def build_row(kwargs: dict[str, Any], ok: bool, start_time: Any, end_time: Any) -> Optional[dict[str, Any]]:
+    def build_row(kwargs: dict[str, Any], ok: bool, start_time: Any, end_time: Any,
+                  response_obj: Any = None) -> Optional[dict[str, Any]]:
         slo: Any = kwargs.get("standard_logging_object")
         slo = slo if isinstance(slo, dict) else {}
         params: Any = kwargs.get("litellm_params")
@@ -135,6 +199,8 @@ class LociCostLedger(CustomLogger):
         error = slo.get("error_information") if isinstance(slo.get("error_information"), dict) else {}
         if not group and not api_base:
             return None
+        call_type = str(slo.get("call_type") or kwargs.get("call_type") or "")
+        cache_read, cache_write = _cache_tokens(response_obj, slo)
         return {
             "ts": round(time.time(), 3),
             "call_id": str(slo.get("litellm_call_id") or kwargs.get("litellm_call_id") or ""),
@@ -146,10 +212,13 @@ class LociCostLedger(CustomLogger):
             "local": _is_local_deployment(str(slo.get("custom_llm_provider") or ""),
                                           str(slo.get("model") or kwargs.get("model") or ""), api_base),
             "ok": bool(ok),
-            "call_type": str(slo.get("call_type") or kwargs.get("call_type") or ""),
+            "call_type": call_type,
             "stream": bool(slo.get("stream") or kwargs.get("stream")),
             "prompt_tokens": int(_num(slo.get("prompt_tokens"))),
             "completion_tokens": int(_num(slo.get("completion_tokens"))),
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "empty_response": bool(ok) and _is_empty_response(call_type, response_obj, slo),
             "cost_usd": _num(slo.get("response_cost") or kwargs.get("response_cost")),
             "latency_s": None if latency is None else round(latency, 3),
             "cache_hit": bool(slo.get("cache_hit")),
@@ -169,11 +238,12 @@ class LociCostLedger(CustomLogger):
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(line)
 
-    async def _record(self, kwargs: dict[str, Any], ok: bool, start_time: Any, end_time: Any) -> None:
+    async def _record(self, kwargs: dict[str, Any], ok: bool, start_time: Any, end_time: Any,
+                      response_obj: Any = None) -> None:
         if _disabled():
             return
         try:
-            row = self.build_row(kwargs, ok, start_time, end_time)
+            row = self.build_row(kwargs, ok, start_time, end_time, response_obj)
             if row is None:
                 _warn_throttled("dropped", "loci cost ledger: dropped a call with no model group and no api_base")
                 return
@@ -183,7 +253,7 @@ class LociCostLedger(CustomLogger):
 
     async def async_log_success_event(self, kwargs: dict[str, Any], response_obj: Any,
                                       start_time: Any, end_time: Any) -> None:
-        await self._record(kwargs, True, start_time, end_time)
+        await self._record(kwargs, True, start_time, end_time, response_obj)
 
     async def async_log_failure_event(self, kwargs: dict[str, Any], response_obj: Any,
                                       start_time: Any, end_time: Any) -> None:

@@ -218,3 +218,10 @@ class BackendResolver:
     @staticmethod
     def pheromone_deposit_disabled() -> bool:
         return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")
+
+def ledger_path() -> str:
+    """Where the cost ledger lives: LOCI_COST_LEDGER_FILE, else `[cost] ledger_file` in the private config,
+    else ~/.loci/litellm_cost_ledger.jsonl. Here (not in cost_ledger) so the offline report can resolve it
+    without importing LiteLLM."""
+    explicit = os.environ.get("LOCI_COST_LEDGER_FILE") or BackendResolver.cost_ledger_file()
+    return str(explicit or (Path.home() / ".loci" / "litellm_cost_ledger.jsonl"))
