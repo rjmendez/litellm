@@ -45,7 +45,9 @@ def test_shim_modules_are_the_same_objects_as_the_package(module, names) -> None
 
 
 def test_every_package_callback_module_has_a_shim_and_vice_versa() -> None:
-    pkg = {p.stem for p in PKG_DIR.glob("*.py")} - {"__init__", "cost_report"}
+    # Offline tools (stdlib only, no LiteLLM) are not callbacks and have no shim.
+    offline = {"cost_report", "ledger_summary"}
+    pkg = {p.stem for p in PKG_DIR.glob("*.py")} - {"__init__"} - offline
     shim = {p.stem for p in SHIM_DIR.glob("*.py")} - {"__init__"}
     assert pkg == shim == set(SHIM_NAMES)
 
