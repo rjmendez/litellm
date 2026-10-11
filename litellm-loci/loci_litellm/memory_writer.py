@@ -39,8 +39,35 @@ class LociMemoryWriter(CustomLogger):
         return client
 
     @staticmethod
+    def _text_of(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            bits = [p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+                    and isinstance(p.get("text"), str)]
+            return " ".join(b.strip() for b in bits if b.strip()).strip()
+        return ""
+
+    @staticmethod
     def _extract_user_message(kwargs: dict[str, Any]) -> str:
         messages: Any = kwargs.get("messages") or []
+        if not messages:
+            prompt: Any = kwargs.get("prompt")
+            if isinstance(prompt, list) and prompt:
+                prompt = prompt[-1]
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt.strip()
+            items: Any = kwargs.get("input")
+            if isinstance(items, str):
+                return items.strip()
+            if isinstance(items, list):
+                for item in reversed(items):
+                    if isinstance(item, dict) and (item.get("role") or "user") == "user":
+                        text = LociMemoryWriter._text_of(item.get("content"))
+                        if text:
+                            return text
+            return ""
         if not isinstance(messages, list):
             return ""
 
@@ -68,7 +95,20 @@ class LociMemoryWriter(CustomLogger):
         try:
             choices: Any = getattr(response_obj, "choices", None) or []
             if not choices:
-                return ""
+                output: Any = getattr(response_obj, "output", None)
+                if output is None and isinstance(response_obj, dict):
+                    output = response_obj.get("output")
+                bits: list[str] = []
+                for item in output if isinstance(output, list) else []:
+                    content: Any = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+                    for part in content if isinstance(content, list) else []:
+                        text: Any = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                        if isinstance(text, str) and text.strip():
+                            bits.append(text.strip())
+                return " ".join(bits).strip()
+            completion_text: Any = getattr(choices[0], "text", None)
+            if isinstance(completion_text, str) and completion_text.strip():
+                return completion_text.strip()
             message: Any = choices[0].message
             content: Any = getattr(message, "content", "") or ""
             if isinstance(content, str):
