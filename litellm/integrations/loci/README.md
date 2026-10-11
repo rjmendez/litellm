@@ -90,6 +90,7 @@ All optional — the integration fails open (no-op) if nothing is configured.
 | `LOCI_CLIENT_RAG_OK_MARKERS` | (empty) | `\|\|`-separated strings a client puts in a request when its own retrieval succeeded. A request carrying one is not grounded a second time. Empty turns the shortcut off. Also settable as `[grounding] client_rag_ok_markers = [...]` in the private config file |
 | `LOCI_TRUST_CLIENT_RAG` | `1` | Set to `0` to ignore the markers above |
 | `LOCI_GROUNDING_AUDIT_FILE` | (unset) | Append a metadata-only delivered/lost row per grounded request |
+| `LOCI_HONOR_INTERNAL_CALL` | `1` | Requests carrying `metadata.loci_internal_call: true` (the memory system's own judges, classifiers and embeddings) are neither grounded nor written back. `0` treats them as user traffic. The marker is an opt-out any authenticated caller can set |
 
 ### Backend config file
 
