@@ -100,9 +100,15 @@ _TYPE_WEIGHT = {"observed": 1.0, "inferred": 0.8, "assumed": 0.6, "gap": 0.4}
 _CLIENT_RAG_OK = "[AUTOMATIC LOCI RAG: OK]"
 _OWN_CONTEXT_PREFIX = "MEMORY MATCH ("
 
-_GROUNDED_CALL_TYPES = frozenset({
+_CHAT_CALL_TYPES = frozenset({
     "completion", "acompletion", "chat_completion", "chat.completions", "completion.completions",
 })
+_TEXT_COMPLETION_CALL_TYPES = frozenset({"text_completion", "atext_completion"})
+_RESPONSES_CALL_TYPES = frozenset({"responses", "aresponses"})
+_ANTHROPIC_CALL_TYPES = frozenset({"anthropic_messages"})
+_GROUNDED_CALL_TYPES = (
+    _CHAT_CALL_TYPES | _TEXT_COMPLETION_CALL_TYPES | _RESPONSES_CALL_TYPES | _ANTHROPIC_CALL_TYPES
+)
 
 # Slash commands that don't need grounding
 _NAVIGATION_SLASH_COMMANDS = frozenset({
@@ -168,7 +174,8 @@ class LociGroundingHook(CustomLogger):
             self._record_grounding_metadata(data, "skipped", "no_intent")
             return None
 
-        existing = self._existing_grounding(data.get("messages"), self._resolver.client_rag_trusted())
+        surface = self._surface(call_type)
+        existing = self._existing_grounding(self._role_texts(data, surface), self._resolver.client_rag_trusted())
         if existing:
             self._record_grounding_metadata(data, existing)
             return data
@@ -177,15 +184,15 @@ class LociGroundingHook(CustomLogger):
             outcome = await self._ground(intent)
         except Exception as exc:
             logger.warning("loci grounding: fail-open error, request continues without retrieved context, error=%r", exc)
-            self._mark_grounding_failure(data, "error", type(exc).__name__)
+            self._mark_grounding_failure(data, "error", type(exc).__name__, surface)
             return data
 
         self._record_grounding_metadata(data, outcome.status, outcome.reason)
         if outcome.status != "grounded":
-            self._inject_failure_notice(data, outcome.status, outcome.reason)
+            self._inject_failure_notice(data, outcome.status, outcome.reason, surface)
             return data
 
-        self._inject_context(data, outcome.context)
+        self._inject_context(data, outcome.context, surface)
         return data
 
     async def async_post_call_response_headers_hook(
@@ -209,33 +216,65 @@ class LociGroundingHook(CustomLogger):
     # ── Existing-grounding detection ─────────────────────────────────────────
 
     @staticmethod
+    def _surface(call_type: Any) -> str:
+        """Which request shape this call type carries: chat, completion, responses or anthropic."""
+        if call_type in _TEXT_COMPLETION_CALL_TYPES:
+            return "completion"
+        if call_type in _RESPONSES_CALL_TYPES:
+            return "responses"
+        if call_type in _ANTHROPIC_CALL_TYPES:
+            return "anthropic"
+        return "chat"
+
+    @staticmethod
     def _text_parts(content: Any) -> list[str]:
         if isinstance(content, str):
             return [content]
         if isinstance(content, list):
             return [p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)]
+                    if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+                    and isinstance(p.get("text"), str)]
         return []
 
     @classmethod
-    def _existing_grounding(cls, messages: Any, trust_client: bool) -> str:
+    def _role_texts(cls, data: dict, surface: str) -> list[tuple[str, str]]:
+        """Every text the request carries as (role, text), whichever API shape delivered it. The instruction
+        slot of a surface (Responses ``instructions``, Anthropic ``system``) reads as role ``system``."""
+        pairs: list[tuple[str, str]] = []
+        if surface == "completion":
+            prompt = data.get("prompt")
+            prompts = prompt if isinstance(prompt, list) else [prompt]
+            return [("user", p) for p in prompts if isinstance(p, str)]
+        if surface == "responses":
+            pairs += [("system", t) for t in cls._text_parts(data.get("instructions"))]
+            items = data.get("input")
+            if isinstance(items, str):
+                return pairs + [("user", items)]
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict):
+                    role = item.get("role") or "user"
+                    pairs += [(role, t) for t in cls._text_parts(item.get("content"))]
+            return pairs
+        if surface == "anthropic":
+            pairs += [("system", t) for t in cls._text_parts(data.get("system"))]
+        for message in data.get("messages") or []:
+            if isinstance(message, dict):
+                pairs += [(message.get("role"), t) for t in cls._text_parts(message.get("content"))]
+        return pairs
+
+    @staticmethod
+    def _existing_grounding(role_texts: list[tuple[str, str]], trust_client: bool) -> str:
         """Why this request needs no proxy-side grounding, or '' when it does.
 
         ``already_grounded``: an earlier hop injected our own MEMORY MATCH system message.
         ``client_grounded``: the client's own retrieval succeeded (Hermes ``[AUTOMATIC LOCI RAG: OK]``).
         A client block that says UNAVAILABLE is not a reason to skip: this is the fallback that makes
         retrieval happen when the client's could not."""
-        if not isinstance(messages, list):
-            return ""
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            role = message.get("role")
-            for text in cls._text_parts(message.get("content")):
-                if role == "system" and text.lstrip().startswith(_OWN_CONTEXT_PREFIX):
-                    return "already_grounded"
-                if trust_client and _CLIENT_RAG_OK in text:
-                    return "client_grounded"
+        for role, text in role_texts:
+            if role == "system" and text.lstrip().startswith(_OWN_CONTEXT_PREFIX):
+                return "already_grounded"
+            if trust_client and _CLIENT_RAG_OK in text:
+                return "client_grounded"
         return ""
 
     # ── Intent extraction ────────────────────────────────────────────────────
@@ -243,7 +282,22 @@ class LociGroundingHook(CustomLogger):
     @staticmethod
     def _extract_user_message(data: dict) -> str:
         """Extract the latest user message from the request payload."""
-        messages = data.get("messages") or []
+        messages = data.get("messages")
+        if messages is None:
+            prompt = data.get("prompt")
+            if isinstance(prompt, str):
+                return prompt
+            if isinstance(prompt, list) and prompt and isinstance(prompt[-1], str):
+                return prompt[-1]
+            items = data.get("input")
+            if isinstance(items, str):
+                return items
+            for item in reversed(items) if isinstance(items, list) else []:
+                if isinstance(item, dict) and (item.get("role") or "user") == "user":
+                    text = " ".join(LociGroundingHook._text_parts(item.get("content")))
+                    if text.strip():
+                        return text
+            return ""
         if not isinstance(messages, list):
             return ""
 
@@ -684,24 +738,39 @@ class LociGroundingHook(CustomLogger):
     # ── Context injection ────────────────────────────────────────────────────
 
     @staticmethod
-    def _inject_context(data: dict, context: str) -> None:
-        """
-        Inject the grounding context into the request as a system message
-        prepended to the messages list. This makes it visible to the LLM
-        without modifying the user's message.
-        """
-        messages = data.get("messages") or []
-        if not isinstance(messages, list):
-            messages = []
+    def _inject_system_text(data: dict, text: str, surface: str = "chat") -> None:
+        """Put ``text`` in the instruction slot the request's API shape has, ahead of what is already there, so
+        the model sees it without the user's own message being modified.
+
+        chat: a system message at the front of ``messages``. completion: prepended to ``prompt`` (there is no
+        system role). responses: ``instructions``. anthropic: the top-level ``system`` field."""
+        if surface == "completion":
+            prompt = data.get("prompt")
+            if isinstance(prompt, list):
+                data["prompt"] = [f"{text}\n\n{p}" if isinstance(p, str) else p for p in prompt]
+            else:
+                data["prompt"] = f"{text}\n\n{prompt or ''}"
+        elif surface == "responses":
+            instructions = data.get("instructions")
+            data["instructions"] = f"{text}\n\n{instructions}" if isinstance(instructions, str) and instructions else text
+        elif surface == "anthropic":
+            system = data.get("system")
+            if isinstance(system, list):
+                data["system"] = [{"type": "text", "text": text}, *system]
+            elif isinstance(system, str) and system:
+                data["system"] = f"{text}\n\n{system}"
+            else:
+                data["system"] = text
+        else:
+            messages = data.get("messages") or []
+            if not isinstance(messages, list):
+                messages = []
+            messages.insert(0, {"role": "system", "content": text})
             data["messages"] = messages
 
-        # Prepend a system message with the grounding context
-        grounding_msg = {
-            "role": "system",
-            "content": context,
-        }
-        messages.insert(0, grounding_msg)
-        data["messages"] = messages
+    @classmethod
+    def _inject_context(cls, data: dict, context: str, surface: str = "chat") -> None:
+        cls._inject_system_text(data, context, surface)
 
     @staticmethod
     def _record_grounding_metadata(data: dict, status: str, reason: str = "") -> None:
@@ -713,28 +782,19 @@ class LociGroundingHook(CustomLogger):
             metadata["loci_grounding_reason"] = reason
         data["metadata"] = metadata
 
-    def _mark_grounding_failure(self, data: dict, status: str, reason: str) -> None:
+    def _mark_grounding_failure(self, data: dict, status: str, reason: str, surface: str = "chat") -> None:
         self._record_grounding_metadata(data, status, reason)
-        self._inject_failure_notice(data, status, reason)
+        self._inject_failure_notice(data, status, reason, surface)
 
-    @staticmethod
-    def _inject_failure_notice(data: dict, status: str, reason: str) -> None:
-        messages = data.get("messages") or []
-        if not isinstance(messages, list):
-            messages = []
-            data["messages"] = messages
-
+    @classmethod
+    def _inject_failure_notice(cls, data: dict, status: str, reason: str, surface: str = "chat") -> None:
         reason_text = reason.replace("_", " ").strip() if reason else "unknown reason"
-        notice = {
-            "role": "system",
-            "content": (
-                f"LOCI_GROUNDING_STATUS: {status}. "
-                f"Grounding did not add retrieved context for this request because {reason_text}. "
-                "Proceed without retrieved memory context."
-            ),
-        }
-        messages.insert(0, notice)
-        data["messages"] = messages
+        notice = (
+            f"LOCI_GROUNDING_STATUS: {status}. "
+            f"Grounding did not add retrieved context for this request because {reason_text}. "
+            "Proceed without retrieved memory context."
+        )
+        cls._inject_system_text(data, notice, surface)
 
 
 # ── Singleton instance for LiteLLM callback registration ────────────────────
