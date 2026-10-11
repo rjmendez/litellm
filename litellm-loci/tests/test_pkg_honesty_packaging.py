@@ -20,6 +20,7 @@ PKG_DIR = PKG_ROOT / "loci_litellm"
 
 SHIM_NAMES = {
     "backend_resolver": ["BackendResolver"],
+    "capability_gate": ["LociCapabilityGate", "loci_capability_gate"],
     "cost_ledger": ["LociCostLedger", "loci_cost_ledger"],
     "grounding_hook": ["LociGroundingHook", "loci_grounding_hook"],
     "memory_writer": ["LociMemoryWriter", "loci_memory_writer"],

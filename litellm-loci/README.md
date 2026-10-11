@@ -8,6 +8,7 @@ LiteLLM proxy callbacks that read from and write to a Qdrant-backed memory store
 | memory writer | `memory_writer.loci_memory_writer` | After a successful call, writes a prompt/answer preview into a Qdrant collection. |
 | tier router | `tier_router.loci_tier_router` | Counts transient failures per model group and logs when a circuit opens. Advisory: it does not change routing. |
 | cost ledger | `cost_ledger.loci_cost_ledger` | Appends one metadata-only JSON line per call to a file. `python -m loci_litellm.cost_report` summarises it. |
+| capability gate | `capability_gate.loci_capability_gate` | Tags a request that carries tool definitions or tool turns with `!<local tag>` so the router can keep it off local deployments. Inert unless router tag filtering is on and the local deployments are tagged (see below). |
 
 `dedup_gate` was a semantic cache. It could not work (LiteLLM treats a dict returned from a pre-call hook as the
 replacement request, not as a response) and was removed. The module remains as an inert placeholder that logs one
@@ -31,6 +32,8 @@ litellm_settings:
     - litellm.integrations.loci.grounding_hook.loci_grounding_hook   # or loci_litellm.grounding_hook.loci_grounding_hook
     - litellm.integrations.loci.memory_writer.loci_memory_writer
     - litellm.integrations.loci.tier_router.loci_tier_router
+    - litellm.integrations.loci.cost_ledger.loci_cost_ledger
+    - litellm.integrations.loci.capability_gate.loci_capability_gate
 ```
 
 Both paths give the same object. `litellm/integrations/loci/*.py` contains no logic; each file re-exports from
@@ -125,6 +128,8 @@ Read once at import (restart to change) unless marked "per call". Defaults are t
 | `LOCI_CB_FAILURE_THRESHOLD` | `5` | Consecutive transient failures before a model group's circuit opens (no time window). |
 | `LOCI_COST_LEDGER_FILE` | `[cost] ledger_file`, else `~/.loci/litellm_cost_ledger.jsonl` | Ledger path. Append-only, no rotation. Rows hold `agent` and `key_alias`; treat as sensitive. Per call. |
 | `LOCI_COST_LEDGER_DISABLED` | unset | `1` stops the ledger once registered. Per call. |
+| `LOCI_CAPABILITY_GATE_DISABLED` | unset | `1` (or `true`/`yes`/`on`) stops the gate from tagging requests. Per call. |
+| `LOCI_LOCAL_DEPLOYMENT_TAG` | `local` | The router tag the gate excludes (`!<tag>`); must match the `tags:` on your local deployments. Per call. |
 | `LOCI_LOCAL_HOSTS` | empty | Comma-separated hostnames counted as `local` in the ledger. Without it only loopback, private, link-local and `100.64.0.0/10` addresses and `localhost` are local; any other hostname counts as cloud. Per call. |
 | `LOCI_LOCAL_SLO_SUCCESS`, `_P95_S`, `_MIN_CALLS` | `0.98`, `20`, `50` | Thresholds used by `cost_report`. |
 
@@ -171,6 +176,20 @@ read a real config:
 python -m pytest litellm-loci/tests -q -p no:cacheprovider
 ```
 
+## Capability gate
+
+`capability_gate` exists because, on the one local model it was measured on (`evals/medium_tier_fit.py`), a
+tool result made the model call the tool again instead of answering, which loops an agent. That is a measurement
+of one model, not a general claim.
+
+What the code does: if the request has `tools`/`functions`, a `tool`/`function` role message, or `tool_calls`, it
+adds `!<LOCI_LOCAL_DEPLOYMENT_TAG>` to `metadata.tags` and sets `metadata.loci_capability_gate = "tools"`. It
+never changes the model or the request body, and an internal error is logged at WARNING and ignored.
+
+What it needs from you, or it does nothing: `router_settings.enable_tag_filtering: true`, and `tags: ["local"]`
+(the same tag name) on every local deployment. It writes only to `metadata`; whether routes that carry
+`litellm_metadata` instead (for example Anthropic `/v1/messages`) honour the tag has not been verified.
+
 ## Behavior changes since 0.1.0
 
 These change what existing deployments observe. Nothing here is applied until the code is deployed.
@@ -194,4 +213,3 @@ These change what existing deployments observe. Nothing here is applied until th
   `vllm_model`, `rerank_model`. Setting one has no effect and logs nothing.
 - **Renamed.** `LOCI_PHERO_EPSILON` is now `LOCI_RECALL_EXPLORE_EPSILON` (the old name is still read).
 - **Version.** `pyproject.toml` is 0.2.0 and `loci_litellm.__version__` reports it at runtime.
-
