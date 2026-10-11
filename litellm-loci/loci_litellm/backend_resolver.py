@@ -30,7 +30,7 @@ logger = logging.getLogger("loci_litellm.backends")
 _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "backends.toml")
 
 _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
-_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:8000")
+_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:18000")
 _OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
 
 
