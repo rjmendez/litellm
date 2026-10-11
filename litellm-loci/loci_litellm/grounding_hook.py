@@ -97,7 +97,6 @@ COLLECTIONS = _BASE_COLLECTIONS + [
 _CONF_TRUST = {"high": 1.0, "medium": 0.7, "low": 0.4}
 _TYPE_WEIGHT = {"observed": 1.0, "inferred": 0.8, "assumed": 0.6, "gap": 0.4}
 
-_CLIENT_RAG_OK = "[AUTOMATIC LOCI RAG: OK]"
 _OWN_CONTEXT_PREFIX = "MEMORY MATCH ("
 
 _CHAT_CALL_TYPES = frozenset({
@@ -175,7 +174,8 @@ class LociGroundingHook(CustomLogger):
             return None
 
         surface = self._surface(call_type)
-        existing = self._existing_grounding(self._role_texts(data, surface), self._resolver.client_rag_trusted())
+        markers = self._resolver.client_rag_ok_markers() if self._resolver.client_rag_trusted() else ()
+        existing = self._existing_grounding(self._role_texts(data, surface), markers)
         if existing:
             self._record_grounding_metadata(data, existing)
             return data
@@ -298,17 +298,18 @@ class LociGroundingHook(CustomLogger):
         return pairs
 
     @staticmethod
-    def _existing_grounding(role_texts: list[tuple[str, str]], trust_client: bool) -> str:
+    def _existing_grounding(role_texts: list[tuple[str, str]], client_ok_markers: tuple[str, ...]) -> str:
         """Why this request needs no proxy-side grounding, or '' when it does.
 
         ``already_grounded``: an earlier hop injected our own MEMORY MATCH system message.
-        ``client_grounded``: the client's own retrieval succeeded (Hermes ``[AUTOMATIC LOCI RAG: OK]``).
+        ``client_grounded``: the request carries a configured client marker, meaning the client's own retrieval
+        succeeded.
         A client block that says UNAVAILABLE is not a reason to skip: this is the fallback that makes
         retrieval happen when the client's could not."""
         for role, text in role_texts:
             if role == "system" and text.lstrip().startswith(_OWN_CONTEXT_PREFIX):
                 return "already_grounded"
-            if trust_client and _CLIENT_RAG_OK in text:
+            if any(marker in text for marker in client_ok_markers):
                 return "client_grounded"
         return ""
 

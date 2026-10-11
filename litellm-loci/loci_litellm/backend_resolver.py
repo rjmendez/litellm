@@ -193,6 +193,27 @@ class BackendResolver:
         return os.environ.get("LOCI_GROUNDING_AUDIT_FILE", "")
 
     @staticmethod
+    def memory_write_collection() -> str:
+        """Collection the memory writer upserts into. Env LOCI_MEMORY_WRITE_COLLECTION, else `[memory]
+        write_collection` in the private config, else the generic `loci_memory`."""
+        return (os.environ.get("LOCI_MEMORY_WRITE_COLLECTION")
+                or _cfg("memory", "write_collection", "")
+                or "loci_memory")
+
+    @staticmethod
+    def client_rag_ok_markers() -> tuple[str, ...]:
+        """Strings a client puts in a request when its own retrieval succeeded. Machine-private: set them in the
+        gitignored config (`[grounding] client_rag_ok_markers = [...]`) or in LOCI_CLIENT_RAG_OK_MARKERS ('||'
+        separated). Empty by default, which turns the client shortcut off."""
+        raw = os.environ.get("LOCI_CLIENT_RAG_OK_MARKERS")
+        if raw is not None:
+            values: list = raw.split("||")
+        else:
+            configured = _cfg("grounding", "client_rag_ok_markers", [])
+            values = configured if isinstance(configured, list) else [configured]
+        return tuple(v.strip() for v in values if isinstance(v, str) and v.strip())
+
+    @staticmethod
     def client_rag_trusted() -> bool:
         return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
 

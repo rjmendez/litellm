@@ -12,6 +12,10 @@ class _Resolver:
     def is_disabled() -> bool:
         return False
 
+    @staticmethod
+    def client_rag_ok_markers() -> tuple:
+        return ("[CLIENT-RAG: OK]",)
+
     def client_rag_trusted(self) -> bool:
         return self.client_trusted
 
@@ -72,6 +76,10 @@ class _DepositResolver:
     @staticmethod
     def qdrant_url() -> str:
         return "http://qdrant.invalid"
+
+    @staticmethod
+    def client_rag_ok_markers() -> tuple:
+        return ("[CLIENT-RAG: OK]",)
 
     @staticmethod
     def client_rag_trusted() -> bool:

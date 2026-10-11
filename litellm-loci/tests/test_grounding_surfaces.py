@@ -5,8 +5,8 @@ import pytest
 from loci_litellm.grounding_hook import GroundingOutcome, LociGroundingHook
 
 CONTEXT = 'MEMORY MATCH (1 results from 1 Qdrant collection) for "q":\n[a|0.9] fact'
-CLIENT_OK = "[AUTOMATIC LOCI RAG: OK]\nCollections: hermes_memory\nfacts\n[/AUTOMATIC LOCI RAG]"
-CLIENT_DOWN = "[AUTOMATIC LOCI RAG: UNAVAILABLE]\nretrieval failed\n[/AUTOMATIC LOCI RAG]"
+CLIENT_OK = "[CLIENT-RAG: OK]\nCollections: notes\nfacts\n[/CLIENT-RAG]"
+CLIENT_DOWN = "[CLIENT-RAG: UNAVAILABLE]\nretrieval failed\n[/CLIENT-RAG]"
 QUESTION = "What did we decide about the relay?"
 
 
@@ -14,6 +14,10 @@ class _Resolver:
     @staticmethod
     def is_disabled() -> bool:
         return False
+
+    @staticmethod
+    def client_rag_ok_markers() -> tuple:
+        return ("[CLIENT-RAG: OK]",)
 
     @staticmethod
     def client_rag_trusted() -> bool:

@@ -8,26 +8,30 @@ GROUNDED = GroundingOutcome(
     status="grounded",
     context='MEMORY MATCH (1 results from 1 Qdrant collection) for "q":\n[a|0.9] fact',
 )
-CLIENT_OK = "[AUTOMATIC LOCI RAG: OK]\nCollections: hermes_memory\nfacts\n[/AUTOMATIC LOCI RAG]"
-CLIENT_DOWN = "[AUTOMATIC LOCI RAG: UNAVAILABLE]\nMandatory retrieval was attempted but failed\n[/AUTOMATIC LOCI RAG]"
+CLIENT_OK = "[CLIENT-RAG: OK]\nCollections: notes\nfacts\n[/CLIENT-RAG]"
+CLIENT_DOWN = "[CLIENT-RAG: UNAVAILABLE]\nMandatory retrieval was attempted but failed\n[/CLIENT-RAG]"
 QUESTION = "What did we decide about the relay?"
 
 
 class _Resolver:
-    def __init__(self, client_trusted: bool = True) -> None:
+    def __init__(self, client_trusted: bool = True, markers: tuple = ("[CLIENT-RAG: OK]",)) -> None:
         self._client_trusted = client_trusted
+        self._markers = markers
 
     @staticmethod
     def is_disabled() -> bool:
         return False
+
+    def client_rag_ok_markers(self) -> tuple:
+        return self._markers
 
     def client_rag_trusted(self) -> bool:
         return self._client_trusted
 
 
 class _RecordingHook(LociGroundingHook):
-    def __init__(self, client_trusted: bool = True) -> None:
-        super().__init__(resolver=_Resolver(client_trusted))
+    def __init__(self, client_trusted: bool = True, markers: tuple = ("[CLIENT-RAG: OK]",)) -> None:
+        super().__init__(resolver=_Resolver(client_trusted, markers))
         self.intents: list[str] = []
 
     async def _ground(self, intent: str) -> GroundingOutcome:

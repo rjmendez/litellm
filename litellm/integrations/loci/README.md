@@ -53,7 +53,7 @@ It logs and tags metadata, but lets LiteLLM's own router handle fallback.
 ### 4. Memory Writer (`memory_writer.py`)
 
 After each successful completion, writes the prompt and a response preview as a
-point in the `LOCI_MEMORY_WRITE_COLLECTION` collection (default `hermes_memory`).
+point in the configured write collection (`LOCI_MEMORY_WRITE_COLLECTION`, default `loci_memory`).
 Grounding can retrieve these points later, so test traffic ends up in memory
 unless the writer is disabled with `LOCI_MEMORY_WRITER_DISABLED=1`.
 
@@ -85,8 +85,11 @@ All optional — the integration fails open (no-op) if nothing is configured.
 | `LOCI_GROUNDING_DISABLED` | (unset) | Set to `1` to disable |
 | `LOCI_PHERO_DEPOSIT_DISABLED` | (unset) | Set to `1` to make grounding read-only (no pheromone write-back) |
 | `LOCI_MEMORY_WRITER_DISABLED` | (unset) | Set to `1` to stop the memory writer |
-| `LOCI_MEMORY_WRITE_COLLECTION` | `hermes_memory` | Collection the memory writer upserts into |
+| `LOCI_MEMORY_WRITE_COLLECTION` | `loci_memory` | Collection the memory writer upserts into (also `[memory] write_collection` in the private config) |
 | `LOCI_CB_FAILURE_THRESHOLD` | `5` | Transient failures before a circuit opens |
+| `LOCI_CLIENT_RAG_OK_MARKERS` | (empty) | `\|\|`-separated strings a client puts in a request when its own retrieval succeeded. A request carrying one is not grounded a second time. Empty turns the shortcut off. Also settable as `[grounding] client_rag_ok_markers = [...]` in the private config file |
+| `LOCI_TRUST_CLIENT_RAG` | `1` | Set to `0` to ignore the markers above |
+| `LOCI_GROUNDING_AUDIT_FILE` | (unset) | Append a metadata-only delivered/lost row per grounded request |
 
 ### Backend config file
 

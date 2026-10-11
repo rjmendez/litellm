@@ -209,7 +209,7 @@ class LociMemoryWriter(CustomLogger):
         if vector is None:
             return
 
-        collection: str = os.environ.get("LOCI_MEMORY_WRITE_COLLECTION", "hermes_memory")
+        collection: str = self._resolver.memory_write_collection()
         prompt_text: str = prompt[:300]
         response_limit: int = int(os.environ.get("LOCI_MEM_MAX_CHARS", "500"))
         response_preview: str = response[:response_limit]

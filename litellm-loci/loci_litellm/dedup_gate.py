@@ -76,7 +76,7 @@ class LociDedupGate(CustomLogger):
 
         threshold: float = float(os.environ.get("LOCI_DEDUP_THRESHOLD", "0.93"))
         window_s: int = int(os.environ.get("LOCI_DEDUP_WINDOW_S", "86400"))
-        collection: str = os.environ.get("LOCI_DEDUP_COLLECTION", "hermes_memory")
+        collection: str = os.environ.get("LOCI_DEDUP_COLLECTION") or self._resolver.memory_write_collection()
         cutoff: float = time.time() - window_s
 
         url = f"{qdrant_url.rstrip('/')}/collections/{collection}/points/search"
