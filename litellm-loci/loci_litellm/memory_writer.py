@@ -141,6 +141,17 @@ class LociMemoryWriter(CustomLogger):
         return ""
 
     @staticmethod
+    def _is_internal_call( kwargs: dict[str, Any]) -> bool:
+        """The request carried the memory system's own-plumbing marker, so it is not memory-worthy."""
+        params: Any = kwargs.get("litellm_params")
+        params = params if isinstance(params, dict) else {}
+        server_request: Any = params.get("proxy_server_request")
+        body: Any = server_request.get("body") if isinstance(server_request, dict) else None
+        sources = [kwargs.get("metadata"), params.get("metadata"),
+                   body.get("metadata") if isinstance(body, dict) else None]
+        return BackendResolver.is_internal_call(*sources)
+
+    @staticmethod
     def _point_id_for(prompt: str, response: str) -> str:
         seed: str = f"{prompt[:200]}{response[:100]}"
         return hashlib.sha256(seed.encode()).hexdigest()[:32]
@@ -238,7 +249,7 @@ class LociMemoryWriter(CustomLogger):
         end_time: float,
     ) -> None:
         try:
-            if _env_flag("LOCI_MEMORY_WRITER_DISABLED"):
+            if _env_flag("LOCI_MEMORY_WRITER_DISABLED") or self._is_internal_call(kwargs):
                 return
 
             prompt: str = self._extract_user_message(kwargs)
@@ -269,7 +280,7 @@ class LociMemoryWriter(CustomLogger):
         end_time: float,
     ) -> None:
         try:
-            if _env_flag("LOCI_MEMORY_WRITER_DISABLED"):
+            if _env_flag("LOCI_MEMORY_WRITER_DISABLED") or self._is_internal_call(kwargs):
                 return
 
             choices: Any = getattr(response_obj, "choices", None) or []

@@ -218,5 +218,15 @@ class BackendResolver:
         return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
 
     @staticmethod
+    def is_internal_call(*metadata_sources) -> bool:
+        """True when a request is marked as the memory system's own plumbing (judges, classifiers, embeddings),
+        which must be neither grounded nor written back to memory. The client sets
+        ``metadata.loci_internal_call``; LOCI_HONOR_INTERNAL_CALL=0 ignores the marker so every request is
+        treated as user traffic. Note the marker is an opt-out any authenticated caller can use."""
+        if os.environ.get("LOCI_HONOR_INTERNAL_CALL", "1").lower() not in ("1", "true", "yes", "on"):
+            return False
+        return any(isinstance(m, dict) and m.get("loci_internal_call") is True for m in metadata_sources)
+
+    @staticmethod
     def pheromone_deposit_disabled() -> bool:
         return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")

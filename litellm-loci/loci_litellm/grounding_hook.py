@@ -150,6 +150,10 @@ class LociGroundingHook(CustomLogger):
             self._record_grounding_metadata(data, "skipped", "disabled")
             return None
 
+        if BackendResolver.is_internal_call(data.get("metadata")):
+            self._record_grounding_metadata(data, "skipped", "internal_call")
+            return None
+
         # Only ground chat completions and text completions
         if call_type not in _GROUNDED_CALL_TYPES:
             self._record_grounding_metadata(data, "skipped", "call_type")
