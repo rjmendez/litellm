@@ -71,6 +71,35 @@ def _exception_types(*candidates: object) -> tuple[type[BaseException], ...]:
     return tuple(c for c in candidates if isinstance(c, type) and issubclass(c, BaseException))
 
 
+class _AbsentPrismaError(Exception):
+    """Stands in for every prisma error class when prisma is not installed. Never raised."""
+
+
+class _AbsentPrisma:
+    """Attribute-compatible stand-in for the prisma package.
+
+    A proxy without a database never installs prisma, but the auth failure path still
+    asks whether an exception is a database error. Every prisma error class resolves to
+    a class nothing raises, so each isinstance check is False and the real exception
+    surfaces instead of ModuleNotFoundError."""
+
+    def __getattr__(self, name: str):
+        return _AbsentPrismaError if name[:1].isupper() else self
+
+
+def _prisma():
+    """The prisma module, imported at call time, or a never-matching stand-in."""
+    try:
+        import prisma
+    except ImportError:
+        return _AbsentPrisma()
+    try:
+        import prisma.engine.errors  # noqa: F401  (submodule attribute used by callers)
+    except ImportError:
+        pass
+    return prisma
+
+
 class PrismaDBExceptionHandler:
     """
     Class to handle DB Exceptions or Connection Errors
@@ -112,7 +141,7 @@ class PrismaDBExceptionHandler:
         Reporting decisions want the opposite breadth; use
         ``is_database_infrastructure_error`` for those.
         """
-        import prisma.engine.errors
+        prisma = _prisma()
 
         if isinstance(e, (*DB_CONNECTION_ERROR_TYPES, DBLookupDeadlineExceeded)):
             return True
@@ -138,7 +167,7 @@ class PrismaDBExceptionHandler:
         ``RecordNotFoundError``, etc.) are excluded — the DB IS reachable and
         the request itself is what failed.
         """
-        import prisma
+        prisma = _prisma()
 
         data_layer_errors: Final = _exception_types(
             prisma.errors.DataError,
@@ -178,7 +207,7 @@ class PrismaDBExceptionHandler:
         per-row data rejection has to additionally consult
         ``is_database_service_unavailable_error`` before acting on a True here.
         """
-        import prisma
+        prisma = _prisma()
 
         return type(e) is prisma.errors.DataError
 
@@ -191,7 +220,7 @@ class PrismaDBExceptionHandler:
         Use this for reconnect logic — data-layer errors like UniqueViolationError
         mean the DB IS reachable, so reconnecting would be pointless.
         """
-        import prisma
+        prisma = _prisma()
 
         if isinstance(e, DB_CONNECTION_ERROR_TYPES):
             return True
@@ -229,14 +258,14 @@ class PrismaDBExceptionHandler:
 
     @staticmethod
     def is_prisma_error(e: Exception) -> bool:
-        import prisma
+        prisma = _prisma()
 
         return isinstance(e, _exception_types(prisma.errors.PrismaError))
 
     @staticmethod
     def is_deadlock_error(e: Exception) -> bool:
         """True iff ``e`` is a Postgres deadlock (P2034 / 40P01) surfaced through prisma."""
-        import prisma
+        prisma = _prisma()
 
         if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
@@ -257,7 +286,7 @@ class PrismaDBExceptionHandler:
         but full, so the failure is neither a transport error (which would tear
         the engine down and open yet more connections against it) nor a
         rejection of the rows being written."""
-        import prisma
+        prisma = _prisma()
 
         if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
@@ -275,7 +304,7 @@ class PrismaDBExceptionHandler:
         applied and the transaction rolled back: the rows it carried are safe to
         re-send, and the pooled connection is free again rather than pinned
         behind the holder."""
-        import prisma
+        prisma = _prisma()
 
         if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
@@ -286,7 +315,7 @@ class PrismaDBExceptionHandler:
     @staticmethod
     def postgres_sqlstate(e: Exception) -> str | None:
         """The SQLSTATE Postgres attached to a failed statement, as prisma surfaces it, or None."""
-        import prisma
+        prisma = _prisma()
 
         if not isinstance(e, _exception_types(prisma.errors.DataError)):
             return None
@@ -302,7 +331,7 @@ class PrismaDBExceptionHandler:
         """True iff ``e`` is Postgres SQLSTATE 25006 surfaced through prisma: the
         pooled session answers reads but rejects writes, so the connection is
         poisoned until the client is recreated."""
-        import prisma
+        prisma = _prisma()
 
         if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
@@ -327,7 +356,7 @@ class PrismaDBExceptionHandler:
         are already classified by type/keyword above, and data-layer ones
         (the DB IS reachable) must stay 401.
         """
-        import prisma
+        prisma = _prisma()
 
         if isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
