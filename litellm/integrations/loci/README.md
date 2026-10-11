@@ -1,8 +1,12 @@
 # Loci Integration for LiteLLM Proxy
 
 Forks [BerriAI/litellm](https://github.com/BerriAI/litellm) and integrates
-[Loci](https://github.com/rjmendez/loci) — a persistent memory MCP server —
-natively into the LiteLLM proxy's callback system.
+[Loci](https://github.com/rjmendez/loci), a persistent memory MCP server,
+into the LiteLLM proxy's callback system.
+
+The implementation lives in the standalone `litellm-loci/loci_litellm` package.
+The modules in this directory are thin shims that re-export it, so both the
+`litellm.integrations.loci.*` and `loci_litellm.*` callback paths work.
 
 ## What it does
 
@@ -37,11 +41,21 @@ never in the codebase.
 
 ### 3. Tier Router (`tier_router.py`)
 
-Per-provider circuit breaker with exponential backoff, ported from Loci's
-fail-open discipline. Distinguishes transient transport errors (timeout,
-connection reset) from permanent failures (auth, model not found) — only
-transient errors count toward the circuit. The circuit is advisory: it logs
-and tags metadata, but lets LiteLLM's own router handle fallback.
+Per-model-group circuit breaker with exponential backoff, ported from Loci's
+fail-open discipline. The circuit key is the router's model group (for example
+`simple-tier`), so the request-time check and the success/failure events agree.
+Distinguishes transient transport errors (timeout, connection reset) from
+permanent failures (auth, model not found). Only transient errors count toward
+the circuit. A failed half-open probe moves to the next backoff step, and
+a success closes the circuit and resets the sequence. The circuit is advisory.
+It logs and tags metadata, but lets LiteLLM's own router handle fallback.
+
+### 4. Memory Writer (`memory_writer.py`)
+
+After each successful completion, writes the prompt and a response preview as a
+point in the `LOCI_MEMORY_WRITE_COLLECTION` collection (default `hermes_memory`).
+Grounding can retrieve these points later, so test traffic ends up in memory
+unless the writer is disabled with `LOCI_MEMORY_WRITER_DISABLED=1`.
 
 ## Installation
 
@@ -69,6 +83,10 @@ All optional — the integration fails open (no-op) if nothing is configured.
 | `LOCI_RECALL_MIN_SCORE` | `0.55` | Min Qdrant cosine score |
 | `LOCI_RECALL_MIN_IMPORTANCE` | `0.2` | Min importance weight |
 | `LOCI_GROUNDING_DISABLED` | (unset) | Set to `1` to disable |
+| `LOCI_PHERO_DEPOSIT_DISABLED` | (unset) | Set to `1` to make grounding read-only (no pheromone write-back) |
+| `LOCI_MEMORY_WRITER_DISABLED` | (unset) | Set to `1` to stop the memory writer |
+| `LOCI_MEMORY_WRITE_COLLECTION` | `hermes_memory` | Collection the memory writer upserts into |
+| `LOCI_CB_FAILURE_THRESHOLD` | `5` | Transient failures before a circuit opens |
 
 ### Backend config file
 
