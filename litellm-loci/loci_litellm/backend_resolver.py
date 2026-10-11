@@ -189,6 +189,10 @@ class BackendResolver:
         return os.environ.get("LOCI_GROUNDING_DISABLED", "").lower() in ("1", "true", "yes", "on")
 
     @staticmethod
+    def grounding_audit_file() -> str:
+        return os.environ.get("LOCI_GROUNDING_AUDIT_FILE", "")
+
+    @staticmethod
     def client_rag_trusted() -> bool:
         return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
 

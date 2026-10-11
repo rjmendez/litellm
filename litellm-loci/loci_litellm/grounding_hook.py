@@ -213,6 +213,41 @@ class LociGroundingHook(CustomLogger):
             headers["x-loci-grounding-reason"] = reason
         return headers
 
+    # ── Delivery audit ───────────────────────────────────────────────────────
+
+    def log_pre_api_call(self, model: str, messages: Any, kwargs: dict) -> None:
+        """Check the payload that is about to leave for the provider. The pre-call hook decides and injects, but a
+        bridge between the proxy and the provider (for example Responses -> chat) can drop the slot the context
+        went into; this is the one place the final body is visible. Metadata only: no prompt or context text."""
+        try:
+            params = kwargs.get("litellm_params") or {}
+            metadata = params.get("metadata") or {}
+            status = metadata.get("loci_grounding_status")
+            if status not in ("grounded", "miss", "unavailable", "error"):
+                return
+            body = (kwargs.get("additional_args") or {}).get("complete_input_dict")
+            payload = body if isinstance(body, (dict, list)) else {"messages": messages}
+            serialized = json.dumps(payload, default=str)
+            marker = _OWN_CONTEXT_PREFIX if status == "grounded" else "LOCI_GROUNDING_STATUS"
+            delivered = marker in serialized
+            row = {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "call_id": str(kwargs.get("litellm_call_id") or ""),
+                "model": str(model or ""),
+                "status": status,
+                "delivered": delivered,
+            }
+            if delivered:
+                logger.info("loci grounding: delivered status=%s model=%s", status, model)
+            else:
+                logger.error("loci grounding: context LOST before the provider call status=%s model=%s", status, model)
+            path = self._resolver.grounding_audit_file()
+            if path:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            logger.debug("loci grounding: delivery audit skipped: %r", exc)
+
     # ── Existing-grounding detection ─────────────────────────────────────────
 
     @staticmethod
