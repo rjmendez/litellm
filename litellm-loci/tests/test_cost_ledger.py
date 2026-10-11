@@ -100,7 +100,7 @@ def test_report_prices_local_tokens_at_the_cheapest_cloud_deployment(tmp_path: P
 
     assert summary["local_savings_usd"] == pytest.approx(60 * (1000 * 0.000001 + 100 * 0.000005))
     assert summary["cloud_spend_usd"] == pytest.approx(0.01)
-    assert summary["meets_slo"] is True and "put it first" in summary["recommendation"]
+    assert summary["meets_slo"] is True and summary["recommendation"] == "local meets the SLO"
 
 
 def test_report_withholds_the_recommendation_when_local_is_flaky_or_thin() -> None:

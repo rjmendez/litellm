@@ -1,4 +1,0 @@
-litellm_settings:
-  callbacks:
-    - litellm.integrations.loci.grounding_hook.loci_grounding_hook
-    - loci_litellm.grounding_hook.loci_grounding_hook

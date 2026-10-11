@@ -1,10 +1,4 @@
-import sys
-from pathlib import Path
-
-_plugin_root = Path(__file__).resolve().parents[3] / "litellm-loci"
-if _plugin_root.exists() and str(_plugin_root) not in sys.path:
-    sys.path.insert(0, str(_plugin_root))
-
+"""Re-export of loci_litellm.cost_ledger (see litellm/integrations/loci/__init__.py)."""
 from loci_litellm.cost_ledger import LociCostLedger, loci_cost_ledger
 
 __all__ = ["LociCostLedger", "loci_cost_ledger"]
