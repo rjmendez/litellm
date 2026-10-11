@@ -112,11 +112,16 @@ class PrismaDBExceptionHandler:
         Reporting decisions want the opposite breadth; use
         ``is_database_infrastructure_error`` for those.
         """
-        import prisma.engine.errors
+        try:
+            import prisma.engine.errors
+        except ImportError:  # no database configured, so nothing can be a prisma error
+            prisma = None
 
         if isinstance(e, (*DB_CONNECTION_ERROR_TYPES, DBLookupDeadlineExceeded)):
             return True
-        if isinstance(e, _exception_types(prisma.engine.errors.EngineConnectionError)):
+        if prisma is not None and isinstance(
+            e, _exception_types(prisma.engine.errors.EngineConnectionError)
+        ):
             return True
         if PrismaDBExceptionHandler.is_database_capacity_error(e):
             return True
@@ -138,22 +143,26 @@ class PrismaDBExceptionHandler:
         ``RecordNotFoundError``, etc.) are excluded — the DB IS reachable and
         the request itself is what failed.
         """
-        import prisma
+        try:
+            import prisma
+        except ImportError:  # no database configured, so nothing can be a prisma error
+            prisma = None
 
-        data_layer_errors: Final = _exception_types(
-            prisma.errors.DataError,
-            prisma.errors.UniqueViolationError,
-            prisma.errors.ForeignKeyViolationError,
-            prisma.errors.MissingRequiredValueError,
-            prisma.errors.RawQueryError,
-            prisma.errors.TableNotFoundError,
-            prisma.errors.RecordNotFoundError,
-        )
-        if isinstance(e, data_layer_errors):
-            return False
+        if prisma is not None:
+            data_layer_errors: Final = _exception_types(
+                prisma.errors.DataError,
+                prisma.errors.UniqueViolationError,
+                prisma.errors.ForeignKeyViolationError,
+                prisma.errors.MissingRequiredValueError,
+                prisma.errors.RawQueryError,
+                prisma.errors.TableNotFoundError,
+                prisma.errors.RecordNotFoundError,
+            )
+            if isinstance(e, data_layer_errors):
+                return False
         if isinstance(e, DB_CONNECTION_ERROR_TYPES):
             return True
-        if isinstance(e, _exception_types(prisma.errors.PrismaError)):
+        if prisma is not None and isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return True
         if isinstance(e, ProxyException) and e.type == ProxyErrorTypes.no_db_connection:
             return True
@@ -257,7 +266,10 @@ class PrismaDBExceptionHandler:
         but full, so the failure is neither a transport error (which would tear
         the engine down and open yet more connections against it) nor a
         rejection of the rows being written."""
-        import prisma
+        try:
+            import prisma
+        except ImportError:  # no database configured, so nothing can be a prisma error
+            return False
 
         if not isinstance(e, _exception_types(prisma.errors.PrismaError)):
             return False
