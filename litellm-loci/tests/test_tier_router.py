@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from loci_litellm.tier_router import _FAILURE_THRESHOLD, LociTierRouter
+import time
+
+from loci_litellm.tier_router import _FAILURE_THRESHOLD, CircuitState, LociTierRouter, ProviderHealth
 
 
 def _event(group: str, deployment_model: str, exception: Exception | None = None) -> dict:
@@ -83,3 +85,50 @@ async def test_permanent_errors_do_not_count_toward_the_circuit() -> None:
     await _fail(router, "medium-tier", "anthropic/claude-haiku-5.5", _FAILURE_THRESHOLD * 2, ValueError("model not found"))
 
     assert "loci_circuit_open" not in await _pre_call_metadata(router, "medium-tier")
+
+
+def _open(health: ProviderHealth) -> None:
+    for _ in range(_FAILURE_THRESHOLD):
+        health.record_failure()
+
+
+def test_failures_while_open_do_not_reopen_or_extend_the_backoff() -> None:
+    health = ProviderHealth("simple-tier")
+    _open(health)
+    first_deadline = health.status()["backoff_until"]
+
+    for _ in range(_FAILURE_THRESHOLD * 2):
+        health.record_failure()
+
+    status = health.status()
+    assert status["circuit_open_count"] == 1
+    assert status["backoff_until"] == first_deadline
+
+
+def test_backoff_grows_each_time_a_half_open_probe_fails() -> None:
+    health = ProviderHealth("simple-tier")
+    _open(health)
+    delays = []
+    for _ in range(3):
+        delays.append(health.status()["backoff_until"] - time.time())
+        health.backoff_until = 0.0
+        assert health.can_proceed() is True
+        assert health.state == CircuitState.HALF_OPEN
+        health.record_failure()
+
+    assert delays[1] >= delays[0] * 1.5
+    assert delays[2] >= delays[1] * 1.5
+    assert health.status()["circuit_open_count"] == 4
+
+
+def test_recovery_resets_the_backoff_sequence() -> None:
+    health = ProviderHealth("simple-tier")
+    _open(health)
+    health.backoff_until = 0.0
+    health.can_proceed()
+    health.record_failure()
+    health.record_success()
+
+    _open(health)
+
+    assert 0.0 < health.status()["backoff_until"] - time.time() <= 1.0

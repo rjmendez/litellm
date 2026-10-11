@@ -73,7 +73,11 @@ class ProviderHealth:
             self.failure_count += 1
             self.total_failures += 1
             self.last_failure_time = time.time()
-            if self.failure_count >= _FAILURE_THRESHOLD:
+            should_open = (
+                self.state == CircuitState.HALF_OPEN
+                or (self.state == CircuitState.CLOSED and self.failure_count >= _FAILURE_THRESHOLD)
+            )
+            if should_open:
                 self._open_circuit()
 
     def record_success(self) -> None:
@@ -90,8 +94,8 @@ class ProviderHealth:
     def _open_circuit(self) -> None:
         self.state = CircuitState.OPEN
         self.circuit_open_count += 1
-        self.backoff_level = min(self.backoff_level, len(_BACKOFF_SEQUENCE) - 1)
-        delay = _BACKOFF_SEQUENCE[self.backoff_level]
+        delay = _BACKOFF_SEQUENCE[min(self.backoff_level, len(_BACKOFF_SEQUENCE) - 1)]
+        self.backoff_level = min(self.backoff_level + 1, len(_BACKOFF_SEQUENCE) - 1)
         self.backoff_until = time.time() + delay
         logger.warning(
             "loci tier_router: %s circuit OPENED after %d failures, backoff %ds",
