@@ -6,9 +6,14 @@ from loci_litellm.grounding_hook import GroundingOutcome, LociGroundingHook
 
 
 class _Resolver:
+    client_trusted = True
+
     @staticmethod
     def is_disabled() -> bool:
         return False
+
+    def client_rag_trusted(self) -> bool:
+        return self.client_trusted
 
 
 class _HookWithOutcome(LociGroundingHook):
@@ -16,8 +21,10 @@ class _HookWithOutcome(LociGroundingHook):
         super().__init__(resolver=_Resolver())
         self._outcome = outcome
         self._exc = exc
+        self.intents: list[str] = []
 
     async def _ground(self, intent: str) -> GroundingOutcome:
+        self.intents.append(intent)
         if self._exc is not None:
             raise self._exc
         assert self._outcome is not None
@@ -65,6 +72,10 @@ class _DepositResolver:
     @staticmethod
     def qdrant_url() -> str:
         return "http://qdrant.invalid"
+
+    @staticmethod
+    def client_rag_trusted() -> bool:
+        return True
 
     def pheromone_deposit_disabled(self) -> bool:
         return self._deposit_disabled

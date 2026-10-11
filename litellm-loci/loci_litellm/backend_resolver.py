@@ -189,5 +189,9 @@ class BackendResolver:
         return os.environ.get("LOCI_GROUNDING_DISABLED", "").lower() in ("1", "true", "yes", "on")
 
     @staticmethod
+    def client_rag_trusted() -> bool:
+        return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
     def pheromone_deposit_disabled() -> bool:
         return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")

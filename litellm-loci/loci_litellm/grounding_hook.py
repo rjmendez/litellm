@@ -97,6 +97,9 @@ COLLECTIONS = _BASE_COLLECTIONS + [
 _CONF_TRUST = {"high": 1.0, "medium": 0.7, "low": 0.4}
 _TYPE_WEIGHT = {"observed": 1.0, "inferred": 0.8, "assumed": 0.6, "gap": 0.4}
 
+_CLIENT_RAG_OK = "[AUTOMATIC LOCI RAG: OK]"
+_OWN_CONTEXT_PREFIX = "MEMORY MATCH ("
+
 _GROUNDED_CALL_TYPES = frozenset({
     "completion", "acompletion", "chat_completion", "chat.completions", "completion.completions",
 })
@@ -139,14 +142,17 @@ class LociGroundingHook(CustomLogger):
     ) -> Exception | str | dict | None:
         """Inject grounded memory context before the LLM call is dispatched."""
         if self._resolver.is_disabled():
+            self._record_grounding_metadata(data, "skipped", "disabled")
             return None
 
         # Only ground chat completions and text completions
         if call_type not in _GROUNDED_CALL_TYPES:
+            self._record_grounding_metadata(data, "skipped", "call_type")
             return None
 
         user_message = self._extract_user_message(data)
         if not user_message or not user_message.strip():
+            self._record_grounding_metadata(data, "skipped", "no_user_message")
             return None
 
         # Skip slash commands
@@ -154,11 +160,18 @@ class LociGroundingHook(CustomLogger):
         if stripped.startswith("/"):
             cmd = stripped.split()[0].lower()
             if cmd in _NAVIGATION_SLASH_COMMANDS:
+                self._record_grounding_metadata(data, "skipped", "navigation_command")
                 return None
 
         intent = self._extract_intent(stripped)
         if not intent:
+            self._record_grounding_metadata(data, "skipped", "no_intent")
             return None
+
+        existing = self._existing_grounding(data.get("messages"), self._resolver.client_rag_trusted())
+        if existing:
+            self._record_grounding_metadata(data, existing)
+            return data
 
         try:
             outcome = await self._ground(intent)
@@ -174,6 +187,56 @@ class LociGroundingHook(CustomLogger):
 
         self._inject_context(data, outcome.context)
         return data
+
+    async def async_post_call_response_headers_hook(
+        self,
+        data: dict,
+        user_api_key_dict: Any,
+        response: object,
+        request_headers: dict | None = None,
+        litellm_call_info: dict | None = None,
+    ) -> dict | None:
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        status = metadata.get("loci_grounding_status") if isinstance(metadata, dict) else None
+        if not isinstance(status, str) or not status:
+            return None
+        headers = {"x-loci-grounding": status}
+        reason = metadata.get("loci_grounding_reason")
+        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", reason):
+            headers["x-loci-grounding-reason"] = reason
+        return headers
+
+    # ── Existing-grounding detection ─────────────────────────────────────────
+
+    @staticmethod
+    def _text_parts(content: Any) -> list[str]:
+        if isinstance(content, str):
+            return [content]
+        if isinstance(content, list):
+            return [p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)]
+        return []
+
+    @classmethod
+    def _existing_grounding(cls, messages: Any, trust_client: bool) -> str:
+        """Why this request needs no proxy-side grounding, or '' when it does.
+
+        ``already_grounded``: an earlier hop injected our own MEMORY MATCH system message.
+        ``client_grounded``: the client's own retrieval succeeded (Hermes ``[AUTOMATIC LOCI RAG: OK]``).
+        A client block that says UNAVAILABLE is not a reason to skip: this is the fallback that makes
+        retrieval happen when the client's could not."""
+        if not isinstance(messages, list):
+            return ""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            for text in cls._text_parts(message.get("content")):
+                if role == "system" and text.lstrip().startswith(_OWN_CONTEXT_PREFIX):
+                    return "already_grounded"
+                if trust_client and _CLIENT_RAG_OK in text:
+                    return "client_grounded"
+        return ""
 
     # ── Intent extraction ────────────────────────────────────────────────────
 
