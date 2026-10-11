@@ -417,13 +417,13 @@ class LociGroundingHook(CustomLogger):
         all_hits.sort(key=lambda h: h["_ms_score"], reverse=True)
         hits = self._mmr_select(all_hits, _RECALL_TOP_K)
 
-        # Pheromone deposit (fire-and-forget, best-effort)
-        for h in hits:
-            if h.get("collection") == "loci_memory" and h.get("point_id"):
-                try:
-                    await self._pheromone_deposit(h)
-                except Exception:
-                    pass
+        if not self._resolver.pheromone_deposit_disabled():
+            for h in hits:
+                if h.get("collection") == "loci_memory" and h.get("point_id"):
+                    try:
+                        await self._pheromone_deposit(h)
+                    except Exception:
+                        pass
 
         context = self._format_results(hits, intent, failed, searched)
         if not context:

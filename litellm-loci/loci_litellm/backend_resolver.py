@@ -187,3 +187,7 @@ class BackendResolver:
     def is_disabled() -> bool:
         """Check if the Loci integration is explicitly disabled."""
         return os.environ.get("LOCI_GROUNDING_DISABLED", "").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def pheromone_deposit_disabled() -> bool:
+        return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")
