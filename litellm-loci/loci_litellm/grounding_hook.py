@@ -97,6 +97,10 @@ COLLECTIONS = _BASE_COLLECTIONS + [
 _CONF_TRUST = {"high": 1.0, "medium": 0.7, "low": 0.4}
 _TYPE_WEIGHT = {"observed": 1.0, "inferred": 0.8, "assumed": 0.6, "gap": 0.4}
 
+_GROUNDED_CALL_TYPES = frozenset({
+    "completion", "acompletion", "chat_completion", "chat.completions", "completion.completions",
+})
+
 # Slash commands that don't need grounding
 _NAVIGATION_SLASH_COMMANDS = frozenset({
     "/new", "/clear", "/compact", "/stop", "/cancel", "/exit", "/quit",
@@ -138,7 +142,7 @@ class LociGroundingHook(CustomLogger):
             return None
 
         # Only ground chat completions and text completions
-        if call_type not in ("completion", "chat_completion", "chat.completions", "completion.completions"):
+        if call_type not in _GROUNDED_CALL_TYPES:
             return None
 
         user_message = self._extract_user_message(data)

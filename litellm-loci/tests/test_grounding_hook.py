@@ -119,3 +119,18 @@ def test_resolver_pheromone_deposit_disabled_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("LOCI_PHERO_DEPOSIT_DISABLED", value)
 
     assert BackendResolver.pheromone_deposit_disabled() is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_type", "grounded"),
+    [("acompletion", True), ("completion", True), ("aembedding", False), ("amoderation", False)],
+)
+async def test_grounding_applies_to_the_call_types_the_proxy_dispatches(call_type: str, grounded: bool) -> None:
+    hook = _HookWithOutcome(GroundingOutcome(status="grounded", context="MEMORY MATCH (1 results) for \"q\":\n[a|0.9] fact"))
+    data = {"messages": [{"role": "user", "content": "Explain the current callback stack"}]}
+
+    result = await hook.async_pre_call_hook(None, None, data, call_type)
+
+    injected = result is not None and result["messages"][0]["role"] == "system"
+    assert injected is grounded
