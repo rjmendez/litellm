@@ -31,6 +31,7 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -96,11 +97,30 @@ COLLECTIONS = _BASE_COLLECTIONS + [
 _CONF_TRUST = {"high": 1.0, "medium": 0.7, "low": 0.4}
 _TYPE_WEIGHT = {"observed": 1.0, "inferred": 0.8, "assumed": 0.6, "gap": 0.4}
 
+_OWN_CONTEXT_PREFIX = "MEMORY MATCH ("
+
+_CHAT_CALL_TYPES = frozenset({
+    "completion", "acompletion", "chat_completion", "chat.completions", "completion.completions",
+})
+_TEXT_COMPLETION_CALL_TYPES = frozenset({"text_completion", "atext_completion"})
+_RESPONSES_CALL_TYPES = frozenset({"responses", "aresponses"})
+_ANTHROPIC_CALL_TYPES = frozenset({"anthropic_messages"})
+_GROUNDED_CALL_TYPES = (
+    _CHAT_CALL_TYPES | _TEXT_COMPLETION_CALL_TYPES | _RESPONSES_CALL_TYPES | _ANTHROPIC_CALL_TYPES
+)
+
 # Slash commands that don't need grounding
 _NAVIGATION_SLASH_COMMANDS = frozenset({
     "/new", "/clear", "/compact", "/stop", "/cancel", "/exit", "/quit",
     "/help", "/models", "/status", "/reset", "/undo", "/redo",
 })
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingOutcome:
+    status: str
+    context: str = ""
+    reason: str = ""
 
 
 class LociGroundingHook(CustomLogger):
@@ -112,9 +132,9 @@ class LociGroundingHook(CustomLogger):
     unchanged. Grounding is best-effort and never blocks the proxy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, resolver: Any = BackendResolver) -> None:
         super().__init__()
-        self._resolver = BackendResolver
+        self._resolver = resolver
 
     # ── Main hook: async_pre_call_hook ──────────────────────────────────────
 
@@ -127,14 +147,21 @@ class LociGroundingHook(CustomLogger):
     ) -> Exception | str | dict | None:
         """Inject grounded memory context before the LLM call is dispatched."""
         if self._resolver.is_disabled():
+            self._record_grounding_metadata(data, "skipped", "disabled")
+            return None
+
+        if BackendResolver.is_internal_call(data.get("metadata")):
+            self._record_grounding_metadata(data, "skipped", "internal_call")
             return None
 
         # Only ground chat completions and text completions
-        if call_type not in ("completion", "chat_completion", "chat.completions", "completion.completions"):
+        if call_type not in _GROUNDED_CALL_TYPES:
+            self._record_grounding_metadata(data, "skipped", "call_type")
             return None
 
         user_message = self._extract_user_message(data)
         if not user_message or not user_message.strip():
+            self._record_grounding_metadata(data, "skipped", "no_user_message")
             return None
 
         # Skip slash commands
@@ -142,30 +169,175 @@ class LociGroundingHook(CustomLogger):
         if stripped.startswith("/"):
             cmd = stripped.split()[0].lower()
             if cmd in _NAVIGATION_SLASH_COMMANDS:
+                self._record_grounding_metadata(data, "skipped", "navigation_command")
                 return None
 
         intent = self._extract_intent(stripped)
         if not intent:
+            self._record_grounding_metadata(data, "skipped", "no_intent")
             return None
+
+        surface = self._surface(call_type)
+        markers = self._resolver.client_rag_ok_markers() if self._resolver.client_rag_trusted() else ()
+        existing = self._existing_grounding(self._role_texts(data, surface), markers)
+        if existing:
+            self._record_grounding_metadata(data, existing)
+            return data
 
         try:
-            grounding_context = await self._ground(intent)
+            outcome = await self._ground(intent)
         except Exception as exc:
-            logger.debug("loci grounding: fail-open on error: %r", exc)
-            return None
+            logger.warning("loci grounding: fail-open error, request continues without retrieved context, error=%r", exc)
+            self._mark_grounding_failure(data, "error", type(exc).__name__, surface)
+            return data
 
-        if not grounding_context:
-            return None
+        self._record_grounding_metadata(data, outcome.status, outcome.reason)
+        if outcome.status != "grounded":
+            self._inject_failure_notice(data, outcome.status, outcome.reason, surface)
+            return data
 
-        self._inject_context(data, grounding_context)
+        self._inject_context(data, outcome.context, surface)
         return data
+
+    async def async_post_call_response_headers_hook(
+        self,
+        data: dict,
+        user_api_key_dict: Any,
+        response: object,
+        request_headers: dict | None = None,
+        litellm_call_info: dict | None = None,
+    ) -> dict | None:
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        status = metadata.get("loci_grounding_status") if isinstance(metadata, dict) else None
+        if not isinstance(status, str) or not status:
+            return None
+        headers = {"x-loci-grounding": status}
+        reason = metadata.get("loci_grounding_reason")
+        if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", reason):
+            headers["x-loci-grounding-reason"] = reason
+        return headers
+
+    # ── Delivery audit ───────────────────────────────────────────────────────
+
+    def log_pre_api_call(self, model: str, messages: Any, kwargs: dict) -> None:
+        """Check the payload that is about to leave for the provider. The pre-call hook decides and injects, but a
+        bridge between the proxy and the provider (for example Responses -> chat) can drop the slot the context
+        went into; this is the one place the final body is visible. Metadata only: no prompt or context text."""
+        try:
+            params = kwargs.get("litellm_params") or {}
+            metadata = params.get("metadata") or {}
+            status = metadata.get("loci_grounding_status")
+            if status not in ("grounded", "miss", "unavailable", "error"):
+                return
+            body = (kwargs.get("additional_args") or {}).get("complete_input_dict")
+            payload = body if isinstance(body, (dict, list)) else {"messages": messages}
+            serialized = json.dumps(payload, default=str)
+            marker = _OWN_CONTEXT_PREFIX if status == "grounded" else "LOCI_GROUNDING_STATUS"
+            delivered = marker in serialized
+            row = {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "call_id": str(kwargs.get("litellm_call_id") or ""),
+                "model": str(model or ""),
+                "status": status,
+                "delivered": delivered,
+            }
+            if delivered:
+                logger.info("loci grounding: delivered status=%s model=%s", status, model)
+            else:
+                logger.error("loci grounding: context LOST before the provider call status=%s model=%s", status, model)
+            path = self._resolver.grounding_audit_file()
+            if path:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            logger.debug("loci grounding: delivery audit skipped: %r", exc)
+
+    # ── Existing-grounding detection ─────────────────────────────────────────
+
+    @staticmethod
+    def _surface(call_type: Any) -> str:
+        """Which request shape this call type carries: chat, completion, responses or anthropic."""
+        if call_type in _TEXT_COMPLETION_CALL_TYPES:
+            return "completion"
+        if call_type in _RESPONSES_CALL_TYPES:
+            return "responses"
+        if call_type in _ANTHROPIC_CALL_TYPES:
+            return "anthropic"
+        return "chat"
+
+    @staticmethod
+    def _text_parts(content: Any) -> list[str]:
+        if isinstance(content, str):
+            return [content]
+        if isinstance(content, list):
+            return [p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+                    and isinstance(p.get("text"), str)]
+        return []
+
+    @classmethod
+    def _role_texts(cls, data: dict, surface: str) -> list[tuple[str, str]]:
+        """Every text the request carries as (role, text), whichever API shape delivered it. The instruction
+        slot of a surface (Responses ``instructions``, Anthropic ``system``) reads as role ``system``."""
+        pairs: list[tuple[str, str]] = []
+        if surface == "completion":
+            prompt = data.get("prompt")
+            prompts = prompt if isinstance(prompt, list) else [prompt]
+            return [("user", p) for p in prompts if isinstance(p, str)]
+        if surface == "responses":
+            pairs += [("system", t) for t in cls._text_parts(data.get("instructions"))]
+            items = data.get("input")
+            if isinstance(items, str):
+                return pairs + [("user", items)]
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict):
+                    role = item.get("role") or "user"
+                    pairs += [(role, t) for t in cls._text_parts(item.get("content"))]
+            return pairs
+        if surface == "anthropic":
+            pairs += [("system", t) for t in cls._text_parts(data.get("system"))]
+        for message in data.get("messages") or []:
+            if isinstance(message, dict):
+                pairs += [(message.get("role"), t) for t in cls._text_parts(message.get("content"))]
+        return pairs
+
+    @staticmethod
+    def _existing_grounding(role_texts: list[tuple[str, str]], client_ok_markers: tuple[str, ...]) -> str:
+        """Why this request needs no proxy-side grounding, or '' when it does.
+
+        ``already_grounded``: an earlier hop injected our own MEMORY MATCH system message.
+        ``client_grounded``: the request carries a configured client marker, meaning the client's own retrieval
+        succeeded.
+        A client block that says UNAVAILABLE is not a reason to skip: this is the fallback that makes
+        retrieval happen when the client's could not."""
+        for role, text in role_texts:
+            if role == "system" and text.lstrip().startswith(_OWN_CONTEXT_PREFIX):
+                return "already_grounded"
+            if any(marker in text for marker in client_ok_markers):
+                return "client_grounded"
+        return ""
 
     # ── Intent extraction ────────────────────────────────────────────────────
 
     @staticmethod
     def _extract_user_message(data: dict) -> str:
         """Extract the latest user message from the request payload."""
-        messages = data.get("messages") or []
+        messages = data.get("messages")
+        if messages is None:
+            prompt = data.get("prompt")
+            if isinstance(prompt, str):
+                return prompt
+            if isinstance(prompt, list) and prompt and isinstance(prompt[-1], str):
+                return prompt[-1]
+            items = data.get("input")
+            if isinstance(items, str):
+                return items
+            for item in reversed(items) if isinstance(items, list) else []:
+                if isinstance(item, dict) and (item.get("role") or "user") == "user":
+                    text = " ".join(LociGroundingHook._text_parts(item.get("content")))
+                    if text.strip():
+                        return text
+            return ""
         if not isinstance(messages, list):
             return ""
 
@@ -339,20 +511,20 @@ class LociGroundingHook(CustomLogger):
 
     # ── Core grounding flow ─────────────────────────────────────────────────
 
-    async def _ground(self, intent: str) -> str:
+    async def _ground(self, intent: str) -> GroundingOutcome:
         """
         Embed the intent, fan out to Qdrant, rank, and return the
         MEMORY MATCH context block. Returns empty string if nothing found.
         """
         qdrant_url = self._resolver.qdrant_url()
         if not qdrant_url:
-            logger.debug("loci grounding: QDRANT_URL not configured, skipping")
-            return ""
+            logger.warning("loci grounding: fail-open, request continues without retrieved context, reason=qdrant_unconfigured")
+            return GroundingOutcome(status="unavailable", reason="qdrant_unconfigured")
 
         vector = await self._embed(intent)
         if vector is None:
-            logger.debug("loci grounding: embedding failed, skipping (fail-open)")
-            return ""
+            logger.warning("loci grounding: fail-open, request continues without retrieved context, reason=embedding_failed")
+            return GroundingOutcome(status="unavailable", reason="embedding_failed")
 
         # Parallel fan-out across all collections
         all_hits: list[dict] = []
@@ -388,7 +560,8 @@ class LociGroundingHook(CustomLogger):
             all_hits.extend(result)
 
         if not all_hits:
-            return ""
+            logger.warning("loci grounding: no matching context found for request")
+            return GroundingOutcome(status="miss", reason="no_matching_context")
 
         # Keyword rerank
         all_hits = self._keyword_rerank(all_hits, intent)
@@ -405,15 +578,19 @@ class LociGroundingHook(CustomLogger):
         all_hits.sort(key=lambda h: h["_ms_score"], reverse=True)
         hits = self._mmr_select(all_hits, _RECALL_TOP_K)
 
-        # Pheromone deposit (fire-and-forget, best-effort)
-        for h in hits:
-            if h.get("collection") == "loci_memory" and h.get("point_id"):
-                try:
-                    await self._pheromone_deposit(h)
-                except Exception:
-                    pass
+        if not self._resolver.pheromone_deposit_disabled():
+            for h in hits:
+                if h.get("collection") == "loci_memory" and h.get("point_id"):
+                    try:
+                        await self._pheromone_deposit(h)
+                    except Exception:
+                        pass
 
-        return self._format_results(hits, intent, failed, searched)
+        context = self._format_results(hits, intent, failed, searched)
+        if not context:
+            logger.warning("loci grounding: no matching context found for request")
+            return GroundingOutcome(status="miss", reason="no_matching_context")
+        return GroundingOutcome(status="grounded", context=context)
 
     # ── Ranking helpers ──────────────────────────────────────────────────────
 
@@ -601,24 +778,63 @@ class LociGroundingHook(CustomLogger):
     # ── Context injection ────────────────────────────────────────────────────
 
     @staticmethod
-    def _inject_context(data: dict, context: str) -> None:
-        """
-        Inject the grounding context into the request as a system message
-        prepended to the messages list. This makes it visible to the LLM
-        without modifying the user's message.
-        """
-        messages = data.get("messages") or []
-        if not isinstance(messages, list):
-            messages = []
+    def _inject_system_text(data: dict, text: str, surface: str = "chat") -> None:
+        """Put ``text`` in the instruction slot the request's API shape has, ahead of what is already there, so
+        the model sees it without the user's own message being modified.
+
+        chat: a system message at the front of ``messages``. completion: prepended to ``prompt`` (there is no
+        system role). responses: ``instructions``. anthropic: the top-level ``system`` field."""
+        if surface == "completion":
+            prompt = data.get("prompt")
+            if isinstance(prompt, list):
+                data["prompt"] = [f"{text}\n\n{p}" if isinstance(p, str) else p for p in prompt]
+            else:
+                data["prompt"] = f"{text}\n\n{prompt or ''}"
+        elif surface == "responses":
+            instructions = data.get("instructions")
+            data["instructions"] = f"{text}\n\n{instructions}" if isinstance(instructions, str) and instructions else text
+        elif surface == "anthropic":
+            system = data.get("system")
+            if isinstance(system, list):
+                data["system"] = [{"type": "text", "text": text}, *system]
+            elif isinstance(system, str) and system:
+                data["system"] = f"{text}\n\n{system}"
+            else:
+                data["system"] = text
+        else:
+            messages = data.get("messages") or []
+            if not isinstance(messages, list):
+                messages = []
+            messages.insert(0, {"role": "system", "content": text})
             data["messages"] = messages
 
-        # Prepend a system message with the grounding context
-        grounding_msg = {
-            "role": "system",
-            "content": context,
-        }
-        messages.insert(0, grounding_msg)
-        data["messages"] = messages
+    @classmethod
+    def _inject_context(cls, data: dict, context: str, surface: str = "chat") -> None:
+        cls._inject_system_text(data, context, surface)
+
+    @staticmethod
+    def _record_grounding_metadata(data: dict, status: str, reason: str = "") -> None:
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["loci_grounding_status"] = status
+        if reason:
+            metadata["loci_grounding_reason"] = reason
+        data["metadata"] = metadata
+
+    def _mark_grounding_failure(self, data: dict, status: str, reason: str, surface: str = "chat") -> None:
+        self._record_grounding_metadata(data, status, reason)
+        self._inject_failure_notice(data, status, reason, surface)
+
+    @classmethod
+    def _inject_failure_notice(cls, data: dict, status: str, reason: str, surface: str = "chat") -> None:
+        reason_text = reason.replace("_", " ").strip() if reason else "unknown reason"
+        notice = (
+            f"LOCI_GROUNDING_STATUS: {status}. "
+            f"Grounding did not add retrieved context for this request because {reason_text}. "
+            "Proceed without retrieved memory context."
+        )
+        cls._inject_system_text(data, notice, surface)
 
 
 # ── Singleton instance for LiteLLM callback registration ────────────────────

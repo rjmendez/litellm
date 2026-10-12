@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -59,6 +60,17 @@ class FakeAsyncClient:
 def _response(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+    )
+
+
+def _stream_chunk(content: str = "", finish_reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content),
+                finish_reason=finish_reason,
+            )
+        ]
     )
 
 
@@ -203,3 +215,45 @@ async def test_investigation_id_in_payload(monkeypatch: pytest.MonkeyPatch) -> N
     assert qdrant_calls
     payload = qdrant_calls[0]["kwargs"]["json"]["points"][0]["payload"]
     assert payload["investigation_id"] == "inv-42"
+
+
+@pytest.mark.asyncio
+async def test_streaming_write_back_on_finish_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LOCI_MEMORY_WRITER_DISABLED", raising=False)
+    writer = LociMemoryWriter()
+    writer._embed_text = AsyncMock(return_value=[0.1] * 768)
+    writer._upsert_point = AsyncMock()
+
+    kwargs = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "This prompt is long enough for the streaming writer path."}],
+        "litellm_call_id": "req-123",
+    }
+
+    await writer.async_log_stream_event(kwargs, _stream_chunk("hello world, this"), 0.0, 0.0)
+    await writer.async_log_stream_event(kwargs, _stream_chunk(" is a long enough"), 0.0, 0.0)
+    await writer.async_log_stream_event(kwargs, _stream_chunk(" stream response!", finish_reason="stop"), 0.0, 0.0)
+
+    assert writer._upsert_point.await_count == 1
+    payload = writer._upsert_point.await_args.args[3]
+    assert payload["response_preview"] == "hello world, this is a long enough stream response!"
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_upsert_until_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LOCI_MEMORY_WRITER_DISABLED", raising=False)
+    writer = LociMemoryWriter()
+    writer._embed_text = AsyncMock(return_value=[0.1] * 768)
+    writer._upsert_point = AsyncMock()
+
+    kwargs = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "This prompt is long enough for the streaming reader path."}],
+        "litellm_call_id": "req-456",
+    }
+
+    await writer.async_log_stream_event(kwargs, _stream_chunk("hello world, this"), 0.0, 0.0)
+    await writer.async_log_stream_event(kwargs, _stream_chunk(" is a long enough"), 0.0, 0.0)
+
+    assert writer._upsert_point.await_count == 0
+    assert writer._stream_buffers["req-456"] == ["hello world, this", " is a long enough"]

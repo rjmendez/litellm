@@ -73,7 +73,11 @@ class ProviderHealth:
             self.failure_count += 1
             self.total_failures += 1
             self.last_failure_time = time.time()
-            if self.failure_count >= _FAILURE_THRESHOLD:
+            should_open = (
+                self.state == CircuitState.HALF_OPEN
+                or (self.state == CircuitState.CLOSED and self.failure_count >= _FAILURE_THRESHOLD)
+            )
+            if should_open:
                 self._open_circuit()
 
     def record_success(self) -> None:
@@ -90,8 +94,8 @@ class ProviderHealth:
     def _open_circuit(self) -> None:
         self.state = CircuitState.OPEN
         self.circuit_open_count += 1
-        self.backoff_level = min(self.backoff_level, len(_BACKOFF_SEQUENCE) - 1)
-        delay = _BACKOFF_SEQUENCE[self.backoff_level]
+        delay = _BACKOFF_SEQUENCE[min(self.backoff_level, len(_BACKOFF_SEQUENCE) - 1)]
+        self.backoff_level = min(self.backoff_level + 1, len(_BACKOFF_SEQUENCE) - 1)
         self.backoff_until = time.time() + delay
         logger.warning(
             "loci tier_router: %s circuit OPENED after %d failures, backoff %ds",
@@ -156,25 +160,20 @@ class LociTierRouter(CustomLogger):
 
     def __init__(self) -> None:
         super().__init__()
-        self._providers: dict[str, ProviderHealth] = defaultdict(
-            lambda: ProviderHealth("unknown")
-        )
+        self._providers: dict[str, ProviderHealth] = {}
         self._lock = threading.RLock()
 
-    def _provider_name(self, data: dict, response: Any = None) -> str:
-        """Extract the provider name from request/response data."""
-        # Try model_info first
-        model_info = data.get("model_info") or {}
-        litellm_params = data.get("litellm_params") or {}
-        model = litellm_params.get("model", "") or data.get("model", "")
-
-        if model:
-            # "ollama/qwen2.5:3b" -> "ollama"
-            parts = model.split("/", 1)
-            if len(parts) > 1:
-                return parts[0]
-            return model
-        return "unknown"
+    @staticmethod
+    def _circuit_key(payload: dict) -> str:
+        litellm_params = payload.get("litellm_params") or {}
+        for metadata in (litellm_params.get("metadata"), payload.get("metadata")):
+            if not isinstance(metadata, dict):
+                continue
+            group = metadata.get("model_group")
+            if isinstance(group, str) and group:
+                return group
+        model = payload.get("model")
+        return model if isinstance(model, str) and model else "unknown"
 
     async def async_pre_call_hook(
         self,
@@ -184,10 +183,12 @@ class LociTierRouter(CustomLogger):
         call_type: Any,
     ) -> Exception | str | dict | None:
         """Check circuit state before the call. Advisory only — does not block."""
-        provider = self._provider_name(data)
+        provider = self._circuit_key(data)
+        if provider == "unknown":
+            return None
 
         with self._lock:
-            health = self._providers[provider]
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
 
         if not health.can_proceed():
             # Log but don't block — let LiteLLM's router handle fallback
@@ -210,9 +211,11 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record success on the provider."""
-        provider = self._provider_name(kwargs)
+        provider = self._circuit_key(kwargs)
+        if provider == "unknown":
+            return
         with self._lock:
-            health = self._providers[provider]
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
         health.record_success()
 
     async def async_log_failure_event(
@@ -223,7 +226,9 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record failure on the provider, classify transient vs permanent."""
-        provider = self._provider_name(kwargs)
+        provider = self._circuit_key(kwargs)
+        if provider == "unknown":
+            return
 
         # Extract the original exception
         exc = kwargs.get("original_exception") or kwargs.get("exception")
@@ -232,9 +237,7 @@ class LociTierRouter(CustomLogger):
             is_transient = _is_transient(exc)
 
         with self._lock:
-            health = self._providers[provider]
-
-        # Only count transient errors toward circuit breaker — permanent
+            health = self._providers.setdefault(provider, ProviderHealth(provider))
         # errors (auth, model not found) are config issues, not provider health
         if is_transient:
             health.record_failure()

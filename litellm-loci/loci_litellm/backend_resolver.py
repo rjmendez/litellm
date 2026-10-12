@@ -30,7 +30,7 @@ logger = logging.getLogger("loci_litellm.backends")
 _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "backends.toml")
 
 _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
-_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:8000")
+_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:18000")
 _OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
 
 
@@ -187,3 +187,46 @@ class BackendResolver:
     def is_disabled() -> bool:
         """Check if the Loci integration is explicitly disabled."""
         return os.environ.get("LOCI_GROUNDING_DISABLED", "").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def grounding_audit_file() -> str:
+        return os.environ.get("LOCI_GROUNDING_AUDIT_FILE", "")
+
+    @staticmethod
+    def memory_write_collection() -> str:
+        """Collection the memory writer upserts into. Env LOCI_MEMORY_WRITE_COLLECTION, else `[memory]
+        write_collection` in the private config, else the generic `loci_memory`."""
+        return (os.environ.get("LOCI_MEMORY_WRITE_COLLECTION")
+                or _cfg("memory", "write_collection", "")
+                or "loci_memory")
+
+    @staticmethod
+    def client_rag_ok_markers() -> tuple[str, ...]:
+        """Strings a client puts in a request when its own retrieval succeeded. Machine-private: set them in the
+        gitignored config (`[grounding] client_rag_ok_markers = [...]`) or in LOCI_CLIENT_RAG_OK_MARKERS ('||'
+        separated). Empty by default, which turns the client shortcut off."""
+        raw = os.environ.get("LOCI_CLIENT_RAG_OK_MARKERS")
+        if raw is not None:
+            values: list = raw.split("||")
+        else:
+            configured = _cfg("grounding", "client_rag_ok_markers", [])
+            values = configured if isinstance(configured, list) else [configured]
+        return tuple(v.strip() for v in values if isinstance(v, str) and v.strip())
+
+    @staticmethod
+    def client_rag_trusted() -> bool:
+        return os.environ.get("LOCI_TRUST_CLIENT_RAG", "1").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def is_internal_call(*metadata_sources) -> bool:
+        """True when a request is marked as the memory system's own plumbing (judges, classifiers, embeddings),
+        which must be neither grounded nor written back to memory. The client sets
+        ``metadata.loci_internal_call``; LOCI_HONOR_INTERNAL_CALL=0 ignores the marker so every request is
+        treated as user traffic. Note the marker is an opt-out any authenticated caller can use."""
+        if os.environ.get("LOCI_HONOR_INTERNAL_CALL", "1").lower() not in ("1", "true", "yes", "on"):
+            return False
+        return any(isinstance(m, dict) and m.get("loci_internal_call") is True for m in metadata_sources)
+
+    @staticmethod
+    def pheromone_deposit_disabled() -> bool:
+        return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")
