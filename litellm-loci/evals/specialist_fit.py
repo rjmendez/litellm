@@ -218,62 +218,54 @@ TOOLS = [
 ]
 
 
+GIT_BASH = r"C:\Program Files\Git\usr\bin\bash.exe"
+GIT_USR_BIN = r"C:\Program Files\Git\usr\bin"
+_ALLOWED = {"ls", "cat", "grep", "egrep", "find", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "sed", "awk",
+            "echo", "true", "pwd", "file", "basename", "dirname", "nl"}
+_FORBIDDEN = re.compile(r"[<>;&`]|\$\(|\$\{|\n|-exec\b|-delete\b|-ok\b|\bsed\b.*\s-i|\bsystem\s*\(|/dev/|\.\./|~")
+
+
+def _pipeline_segments(command: str) -> list:
+    """Split on | and || that are outside single or double quotes."""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                cur.append(command[i + 1]); i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch; cur.append(ch)
+        elif ch == "|":
+            segs.append("".join(cur)); cur = []
+            if i + 1 < len(command) and command[i + 1] == "|":
+                i += 1
+        else:
+            cur.append(ch)
+        i += 1
+    segs.append("".join(cur))
+    return segs
+
+
 def sandbox_exec(root: Path, command: str) -> str:
-    """A tiny read-only shell: ls, cat, head, grep, find, wc, with simple pipes, confined to the repo."""
-    def safe(p: str) -> Path:
-        q = (root / p.lstrip("/")).resolve()
-        if root.resolve() not in q.parents and q != root.resolve():
-            raise ValueError("outside repository")
-        return q
+    """Run a read-only command with real GNU tools (Git's usr/bin) inside the temp repo copy.
 
-    def run_one(parts: list, stdin: str | None) -> str:
-        cmd, args = parts[0], [a for a in parts[1:]]
-        if cmd == "ls":
-            paths = [a for a in args if not a.startswith("-")] or ["."]
-            out = []
-            for p in paths:
-                q = safe(p)
-                out += sorted(x.name + ("/" if x.is_dir() else "") for x in q.iterdir()) if q.is_dir() else [q.name]
-            return "\n".join(out)
-        if cmd in ("cat", "head", "tail"):
-            files = [a for a in args if not a.startswith("-") and not a.isdigit()]
-            text = "".join(safe(f).read_text(encoding="utf-8") for f in files) if files else (stdin or "")
-            n = 10
-            if "-n" in args:
-                n = int(args[args.index("-n") + 1])
-            lines = text.splitlines()
-            return "\n".join(lines if cmd == "cat" else (lines[:n] if cmd == "head" else lines[-n:]))
-        if cmd == "grep":
-            flags = [a for a in args if a.startswith("-")]
-            rest = [a for a in args if not a.startswith("-")]
-            pat = rest[0]
-            targets = rest[1:] or ["."]
-            rx = re.compile(pat, re.I if any("i" in f for f in flags) else 0)
-            lines = []
-            if stdin is not None and len(rest) == 1:
-                return "\n".join(l for l in stdin.splitlines() if rx.search(l))
-            for t in targets:
-                q = safe(t)
-                files = [q] if q.is_file() else sorted(x for x in q.rglob("*") if x.is_file())
-                for fp in files:
-                    for i, l in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
-                        if rx.search(l):
-                            lines.append(f"{fp.relative_to(root).as_posix()}:{i}:{l}" if any("n" in f for f in flags) or any("r" in f for f in flags) else f"{fp.relative_to(root).as_posix()}:{l}")
-            return "\n".join(lines)
-        if cmd == "find":
-            start = next((a for a in args if not a.startswith("-")), ".")
-            return "\n".join(sorted(x.relative_to(root).as_posix() for x in safe(start).rglob("*") if x.is_file()))
-        if cmd == "wc":
-            return str(len((stdin or "").splitlines()))
-        raise ValueError(f"command not available: {cmd}")
-
+    Only allowlisted programs, no redirection, command substitution, chaining or path escapes; 10 s timeout."""
+    if _FORBIDDEN.search(command):
+        return "error: command not permitted in this sandbox"
+    for seg in _pipeline_segments(command):
+        words = seg.strip().split()
+        if not words or words[0] not in _ALLOWED:
+            return f"error: command not available: {words[0] if words else ''}"
+    env = {"PATH": GIT_USR_BIN, "LC_ALL": "C", "HOME": str(root), "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows")}
     try:
-        out = None
-        for seg in command.split("|"):
-            out = run_one(shlex.split(seg.strip()), out)
-        return out or "(no output)"
-    except Exception as exc:
-        return f"error: {exc}"
+        r = subprocess.run([GIT_BASH, "-c", command], cwd=str(root), capture_output=True, text=True, timeout=10, env=env)
+    except subprocess.TimeoutExpired:
+        return "error: timeout"
+    out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode not in (0, 1) and r.stderr else "")
+    return out.strip()[:3000] or "(no output)"
 
 
 def antares(base, model, gguf, max_turns=15):
@@ -365,6 +357,8 @@ def rtl(base, model, num_predict=900):
         ok, why = False, ""
         with tempfile.TemporaryDirectory() as td:
             Path(td, "d.v").write_text(code, encoding="utf-8")
+            # a string in a ?: prints as a decimal number in Verilog ($display(ok?"PASS":"FAIL") -> 1346458451), so branch instead
+            tb = tb.replace('$display(ok?"PASS":"FAIL");', 'if (ok) $display("PASS"); else $display("FAIL");')
             Path(td, "tb.v").write_text(tb, encoding="utf-8")
             try:
                 c = subprocess.run([IVERILOG, "-g2012", "-o", "sim", "d.v", "tb.v"], cwd=td, capture_output=True, text=True, timeout=60)
