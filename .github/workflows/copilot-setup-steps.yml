@@ -28,7 +28,8 @@ jobs:
       - name: Install litellm-loci dependencies
         run: |
           cd litellm-loci
-          pip install -e . || pip install pytest litellm python-dotenv
+          pip install -e ".[dev]" 2>/dev/null || pip install litellm httpx python-dotenv
+          pip install pytest  # guarantee pytest regardless of setup.py extras
 
       - name: Verify loci_litellm imports
         run: |
