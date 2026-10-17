@@ -187,6 +187,47 @@ Output:
 1697500030.2: max_chars_exceeded — Request exceeds max chars: 15000 > 10000
 ```
 
+## Tool Call Enforcement
+
+Set `LOCI_POLICY_ALLOWED_TOOLS` to a comma-separated list of allowed tool names.
+If unset, all tools are permitted.
+
+```bash
+export LOCI_POLICY_ALLOWED_TOOLS=web_search,read_file,list_directory
+```
+
+Requests containing tools not in this list are flagged as `tool_not_allowed` violations.
+Combined with `LOCI_POLICY_BLOCK_VIOLATIONS=1`, the request is rejected outright.
+
+## Trajectory Persistence
+
+Set `LOCI_TRAJECTORY_DIR` (default: `~/.loci/trajectories`) to control where
+step-level reward trajectories are written. Each policy gets its own JSONL file:
+`{LOCI_TRAJECTORY_DIR}/{policy_id}.jsonl`.
+
+These files are consumed by `mcp__loci__policy_evolve` (companion loci PR) to
+close the DRPG loop and promote policies based on accumulated evidence.
+
+Each line is one JSON object with keys `timestamp`, `policy_id`, `model`,
+`prompt_tokens`, `response_time_ms`, and `reward` (the full 7D tensor).
+
+## Default Enablement
+
+The recommended production configuration is opt-out (always-on):
+
+```yaml
+# config.yaml
+callbacks:
+  - path: ./loci_litellm/policy_hook.py
+    class: LociPolicyHook
+general_settings:
+  environment_variables:
+    LOCI_POLICY_ENABLE: "1"
+```
+
+To disable policy enforcement for a specific deployment, set `LOCI_POLICY_ENABLE=0`
+in that deployment's environment without changing the shared config.
+
 ## Grounded References
 
 This implementation is grounded in:
