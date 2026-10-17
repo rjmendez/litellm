@@ -17,7 +17,47 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+_warned_env: set[str] = set()  # mutable-ok: once-per-variable warning memo
+
+
+def _env_number(name: str, default: Any, cast: Callable[[str], Any] = float) -> Any:
+    """Read a numeric env var; on a bad value use the default and say so once (WARNING)."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return cast(raw.strip())
+    except (TypeError, ValueError):
+        if name not in _warned_env:
+            _warned_env.add(name)
+            logger.warning(
+                "loci memory writer: %s=%r is not a valid %s; using default %r",
+                name, raw, cast.__name__, default,
+            )
+        return default
+
+
+# Cap on distinct failure reasons tracked, so odd error text cannot grow the dict.
+_MAX_FAILURE_KEYS = 64
+
+
 class LociMemoryWriter(CustomLogger):
+    """Writes a (prompt preview, answer preview) record for each completed completion.
+
+    Behaviour, as implemented:
+    - Fail-open: a failure never reaches the request. Each failure is logged at WARNING
+      (first occurrence of each distinct reason, then every 100th) and counted in
+      ``failure_counts`` (reason -> count).
+    - Writes are best-effort and unconfirmed: the upsert uses ``wait=false``, so an HTTP 200
+      means Qdrant accepted the operation, not that the point is applied or searchable.
+    - Stored text is the raw prompt (first 300 chars) and answer (first LOCI_MEM_MAX_CHARS
+      chars). No secret or PII redaction is performed.
+    - ``investigation_id`` comes from the process-wide LOCI_INVESTIGATION_ID env var and is
+      stamped on every record regardless of who made the request.
+    - Streaming calls are recorded from litellm's success event, which carries the assembled
+      response. A stream for which litellm cannot assemble a response is not recorded.
+    """
+
     def __init__(
         self,
         _http_client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
@@ -27,15 +67,28 @@ class LociMemoryWriter(CustomLogger):
         self._http_client_factory: Callable[[], httpx.AsyncClient] = (
             _http_client_factory or (lambda: httpx.AsyncClient())
         )
-        self._stream_buffers: dict[str, list[str]] = {}  # mutable-ok: stream accumulation buffer, cleared on finish
+        self.failure_counts: dict[str, int] = {}  # mutable-ok: operator-visible failure counter, bounded by _MAX_FAILURE_KEYS
+
+    def _note_failure(self, reason: str) -> None:
+        """Count a fail-open event and log it at WARNING (first of each reason, then every 100th)."""
+        if reason not in self.failure_counts and len(self.failure_counts) >= _MAX_FAILURE_KEYS:
+            reason = "other"
+        count = self.failure_counts.get(reason, 0) + 1
+        self.failure_counts[reason] = count
+        if count == 1 or count % 100 == 0:
+            logger.warning(
+                "loci memory writer: record NOT written (fail-open): %s [occurrence %d]", reason, count
+            )
 
     def _client_for_timeout(self, timeout: float) -> httpx.AsyncClient:
         client = self._http_client_factory()
         if hasattr(client, "timeout"):
             try:
                 client.timeout = timeout  # pyright: ignore[reportAttributeAccessIssue]
-            except Exception:
-                pass
+            except Exception as exc:
+                self._note_failure(
+                    f"could not apply the configured timeout to the HTTP client ({type(exc).__name__}); client default applies"
+                )
         return client
 
     @staticmethod
@@ -90,8 +143,7 @@ class LociMemoryWriter(CustomLogger):
                 return " ".join(bits).strip()
         return ""
 
-    @staticmethod
-    def _extract_response_text(response_obj: Any) -> str:
+    def _extract_response_text(self, response_obj: Any) -> str:
         try:
             choices: Any = getattr(response_obj, "choices", None) or []
             if not choices:
@@ -126,23 +178,18 @@ class LociMemoryWriter(CustomLogger):
                 joined = " ".join(bits).strip()
                 if joined:
                     return joined
-            reasoning_content: Any = getattr(message, "reasoning_content", "") or ""
-            if isinstance(reasoning_content, str):
-                stripped_reasoning = reasoning_content.strip()
-                if stripped_reasoning:
-                    return stripped_reasoning
-            provider_specific_fields: Any = getattr(message, "provider_specific_fields", None) or {}
-            if isinstance(provider_specific_fields, dict):
-                reasoning: Any = provider_specific_fields.get("reasoning") or ""
-                if isinstance(reasoning, str):
-                    return reasoning.strip()
-        except Exception:
+            # Reasoning-only responses (empty content) are deliberately NOT returned: chain of
+            # thought is not the answer and must not be stored as one.
+        except Exception as exc:
+            self._note_failure(f"could not extract response text ({type(exc).__name__})")
             return ""
         return ""
 
     @staticmethod
-    def _is_internal_call( kwargs: dict[str, Any]) -> bool:
-        """The request carried the memory system's own-plumbing marker, so it is not memory-worthy."""
+    def _is_internal_call(kwargs: dict[str, Any]) -> bool:
+        """True when the client set the metadata.loci_internal_call opt-out (honored unless
+        LOCI_HONOR_INTERNAL_CALL=0). A client-supplied flag, not a trusted classification:
+        any caller can use it to suppress write-back."""
         params: Any = kwargs.get("litellm_params")
         params = params if isinstance(params, dict) else {}
         server_request: Any = params.get("proxy_server_request")
@@ -152,13 +199,19 @@ class LociMemoryWriter(CustomLogger):
         return BackendResolver.is_internal_call(*sources)
 
     @staticmethod
-    def _point_id_for(prompt: str, response: str) -> str:
-        seed: str = f"{prompt[:200]}{response[:100]}"
-        return hashlib.sha256(seed.encode()).hexdigest()[:32]
+    def _point_id_for(prompt: str, response: str, model: str = "") -> str:
+        """Hash of the full model, prompt and response: only an identical triple overwrites an
+        earlier record (and refreshes its created_at_ts)."""
+        h = hashlib.sha256()
+        for part in (model, prompt, response):
+            h.update(part.encode("utf-8", "replace"))
+            h.update(b"\x00")
+        return h.hexdigest()[:32]
 
     async def _embed_text(self, text: str) -> Optional[list[float]]:
         base: Optional[str] = self._resolver.embed_api_base()
         if not base:
+            self._note_failure("no embedding API base resolved (set LOCI_OLLAMA_BASE_URL or equivalent)")
             return None
 
         url: str = f"{base.rstrip('/')}/embeddings"
@@ -168,7 +221,7 @@ class LociMemoryWriter(CustomLogger):
             headers["Authorization"] = f"Bearer {api_key}"
 
         body: dict[str, Any] = {"model": self._resolver.embed_model(), "input": text}
-        timeout: float = float(os.environ.get("LOCI_MEM_EMBED_TIMEOUT", "3.0"))
+        timeout: float = _env_number("LOCI_MEM_EMBED_TIMEOUT", 3.0)
         try:
             async with self._client_for_timeout(timeout) as client:
                 response = await client.post(url, json=body, headers=headers)
@@ -176,7 +229,7 @@ class LociMemoryWriter(CustomLogger):
                 data: Any = response.json()
             return data["data"][0]["embedding"]
         except Exception as exc:
-            logger.debug("loci memory writer: embed fail-open: %r", exc)
+            self._note_failure(f"embedding request failed ({type(exc).__name__})")
             return None
 
     async def _upsert_point(
@@ -188,8 +241,10 @@ class LociMemoryWriter(CustomLogger):
     ) -> None:
         qdrant_url: str = self._resolver.qdrant_url()
         if not qdrant_url:
+            self._note_failure("no Qdrant URL resolved (set LOCI_QDRANT_URL)")
             return
 
+        # wait=false: Qdrant acknowledges acceptance only; the write is unconfirmed.
         url: str = f"{qdrant_url.rstrip('/')}/collections/{collection}/points?wait=false"
         headers: dict[str, str] = {"Content-Type": "application/json"}
         api_key: str = self._resolver.qdrant_api_key()
@@ -205,24 +260,24 @@ class LociMemoryWriter(CustomLogger):
                 },
             ]
         }
-        timeout: float = float(os.environ.get("LOCI_MEM_QDRANT_TIMEOUT", "2.0"))
+        timeout: float = _env_number("LOCI_MEM_QDRANT_TIMEOUT", 2.0)
         async with self._client_for_timeout(timeout) as client:
             response = await client.put(url, json=body, headers=headers)
             response.raise_for_status()
 
     async def _write_qa_point(self, kwargs: dict[str, Any], prompt: str, response: str) -> None:
-        min_prompt_len: int = int(os.environ.get("LOCI_MEM_MIN_PROMPT_LEN", "20"))
+        min_prompt_len: int = _env_number("LOCI_MEM_MIN_PROMPT_LEN", 20, int)
         if len(prompt) < min_prompt_len or len(response) < min_prompt_len:
             return
 
-        embed_text: str = f"{prompt}\n\n{response[:200]}"
-        vector: Optional[list[float]] = await self._embed_text(embed_text)
+        # The vector embeds the prompt only; recall queries are also prompts.
+        vector: Optional[list[float]] = await self._embed_text(prompt)
         if vector is None:
             return
 
         collection: str = self._resolver.memory_write_collection()
         prompt_text: str = prompt[:300]
-        response_limit: int = int(os.environ.get("LOCI_MEM_MAX_CHARS", "500"))
+        response_limit: int = _env_number("LOCI_MEM_MAX_CHARS", 500, int)
         response_preview: str = response[:response_limit]
 
         payload: dict[str, Any] = {
@@ -232,13 +287,15 @@ class LociMemoryWriter(CustomLogger):
             "model": kwargs.get("model") or "",
             "created_at_ts": time.time(),
             "source": "litellm",
-            "record_type": "observed",
-            "confidence": "medium",
-            "importance": 0.6,
+            # Unverified model output: nobody observed it, so it is not "observed"/"medium".
+            "record_type": "inferred",
+            "confidence": "low",
+            "provenance": "model_output",
             "pheromone": 0.0,
+            # Process-global: every record gets the same id, whoever made the request.
             "investigation_id": os.environ.get("LOCI_INVESTIGATION_ID", ""),
         }
-        point_id: str = self._point_id_for(prompt, response)
+        point_id: str = self._point_id_for(prompt, response, str(kwargs.get("model") or ""))
         await self._upsert_point(collection, point_id, vector, payload)
 
     async def async_log_success_event(
@@ -259,74 +316,7 @@ class LociMemoryWriter(CustomLogger):
 
             await self._write_qa_point(kwargs, prompt, response)
         except Exception as exc:
-            logger.debug("loci memory writer: fail-open on error: %r", exc)
-            return
-
-    @staticmethod
-    def _stream_request_key(kwargs: dict[str, Any]) -> str:
-        call_id: Any = kwargs.get("litellm_call_id") or kwargs.get("request_id")
-        if call_id is not None:
-            return str(call_id)
-        prompt: str = LociMemoryWriter._extract_user_message(kwargs)
-        if prompt:
-            return hashlib.sha256(prompt[:200].encode()).hexdigest()[:32]
-        return f"stream-{hashlib.sha256(repr(sorted(kwargs.items())).encode()).hexdigest()[:16]}"
-
-    async def async_log_stream_event(
-        self,
-        kwargs: dict[str, Any],
-        response_obj: Any,
-        start_time: float,
-        end_time: float,
-    ) -> None:
-        try:
-            if _env_flag("LOCI_MEMORY_WRITER_DISABLED") or self._is_internal_call(kwargs):
-                return
-
-            choices: Any = getattr(response_obj, "choices", None) or []
-            if not choices:
-                return
-            choice: Any = choices[0]
-            delta: Any = getattr(choice, "delta", None)
-            if delta is None:
-                return
-
-            content: Any = getattr(delta, "content", None) or ""
-            if isinstance(content, list):
-                content = "".join(
-                    str(part.get("text") or "")
-                    for part in content
-                    if isinstance(part, dict)
-                )
-            if not isinstance(content, str):
-                content = str(content)
-
-            request_key: str = self._stream_request_key(kwargs)
-            if content:
-                self._stream_buffers.setdefault(request_key, [])
-                self._stream_buffers[request_key].append(content)
-
-            finish_reason: Any = getattr(choice, "finish_reason", None)
-            if finish_reason is None:
-                return
-
-            prompt: str = self._extract_user_message(kwargs)
-            if not prompt:
-                self._stream_buffers.pop(request_key, None)
-                return
-
-            accumulated: str = "".join(self._stream_buffers.pop(request_key, []))
-            if not accumulated:
-                return
-
-            await self._write_qa_point(kwargs, prompt, accumulated)
-        except Exception as exc:
-            logger.debug("loci memory writer: fail-open on stream error: %r", exc)
-            try:
-                request_key: str = self._stream_request_key(kwargs)
-                self._stream_buffers.pop(request_key, None)
-            except Exception:
-                pass
+            self._note_failure(f"write-back failed ({type(exc).__name__}: {str(exc)[:120]})")
             return
 
 

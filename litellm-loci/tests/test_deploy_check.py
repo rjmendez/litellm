@@ -69,7 +69,7 @@ def test_local_and_embedding_deployments_need_no_price(cfg):
     assert not any("local-simple" in x or "embed-nomic" in x for x in v)
 
 
-@pytest.mark.parametrize("base", ["http://100.73.200.19:4443/v1", "http://127.0.0.1:11435", "https://[::1]:4443"])
+@pytest.mark.parametrize("base", ["http://198.51.100.7:4443/v1", "http://127.0.0.1:11435", "https://[::1]:4443"])
 def test_ip_literal_api_base_is_rejected(cfg, base):
     next(d for d in cfg["model_list"] if d["model_info"]["id"] == "cloud-simple")["litellm_params"]["api_base"] = base
     v, _ = cd.check(cfg)
@@ -78,8 +78,8 @@ def test_ip_literal_api_base_is_rejected(cfg, base):
 
 @pytest.mark.parametrize("key,value", [
     ("OLLAMA_PROXY_URL", "http://127.0.0.1:11435"),
-    ("LOCI_OLLAMA_BASE_URL", "http://100.73.200.19:11434"),
-    ("OLLAMA_API_BASE", "http://10.42.0.1:11434"),
+    ("LOCI_OLLAMA_BASE_URL", "http://198.51.100.7:11434"),
+    ("OLLAMA_API_BASE", "http://203.0.113.9:11434"),
 ])
 def test_ip_literal_in_env_is_rejected(cfg, key, value):
     v, _ = cd.check(cfg, {key: value})

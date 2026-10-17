@@ -1,12 +1,34 @@
-"""Report on the cost ledger: spend per model group, what the local tier saved, and whether local is
-reliable enough to put first.
+"""Report on the cost ledger: spend per model group, what the local tier saved, and whether local meets
+the reliability bar.
 
     python -m loci_litellm.cost_report --config <litellm config.yaml> [--ledger FILE] [--since-hours 24]
+                                       [--exclude-internal] [--json]
 
-Savings are counterfactual: every token served locally is priced at the cheapest cloud deployment of the
-same model group (its `input_cost_per_token` / `output_cost_per_token` in the config). The report also
-states, per group, whether local meets the reliability bar (LOCI_LOCAL_SLO_SUCCESS, LOCI_LOCAL_SLO_P95_S,
-LOCI_LOCAL_SLO_MIN_CALLS) and what order flip that would justify. It only reports; it never edits config.
+What the numbers are:
+  - Counts are per ATTEMPT (one ledger row per LiteLLM call, retries and fallbacks included), not per
+    client request.
+  - "local" is the ledger's `local` field, an address-class heuristic on the deployment host (see
+    cost_ledger). A local GPU host reached by a plain hostname counts as cloud unless it is named in
+    LOCI_LOCAL_HOSTS when the ledger is written.
+  - Savings are counterfactual: every token served successfully by a local deployment is priced at the
+    group's priced deployment with the lowest (input + output) per-token price sum, taken from
+    `model_info.input_cost_per_token` / `output_cost_per_token` in the config, local deployments included:
+    a local deployment that declares a price (or an explicit 0) is a candidate, and a 0 makes the group's
+    savings 0. It ignores the real input/output mix. A group with no priced deployment reports savings as null ("n/a"), not zero.
+  - Latency percentiles (local_p50_s / local_p95_s) are over SUCCESSFUL local calls only; failed calls
+    are excluded from them. Rows whose latency is null are skipped.
+  - ok% is the share of local calls that succeeded AND returned an answer: a call that succeeded but came
+    back empty (`empty_response`) counts as a failure for the SLO, because the caller got nothing. The
+    `empty` column is that count over all calls of the group, local and cloud.
+  - cache% is cache_read_tokens / prompt_tokens over the group's rows, as the provider reported them. A
+    ledger written before those fields existed reads as 0%. It is not a billing figure.
+  - By default internal calls (judges, classifiers, embeddings flagged by the memory system) are
+    included in every figure; --exclude-internal drops them. The mode is printed.
+  - The SLO is LOCI_LOCAL_SLO_SUCCESS (default 0.98), LOCI_LOCAL_SLO_P95_S (default 20) and
+    LOCI_LOCAL_SLO_MIN_CALLS (default 50). A malformed value falls back to the default with a warning.
+  - The verdict says only whether local met the SLO and which criterion failed. The report does not read
+    deployment order from the config, so it cannot say whether the order already matches.
+Unparseable ledger lines are counted and reported on stderr. It only reports; it never edits config.
 """
 from __future__ import annotations
 
@@ -17,7 +39,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable, Optional
 
 
 def _pctl(values: list, q: float) -> float:
@@ -27,8 +49,20 @@ def _pctl(values: list, q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * (len(ordered) - 1) + 0.5))]
 
 
+def _env_number(name: str, default: float, cast=float):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"warning: {name}={raw!r} is not a number; using the default {default}", file=sys.stderr)
+        return default
+
+
 def cloud_prices(config_path: str) -> dict:
-    """{group: (input_per_token, output_per_token)} of each group's cheapest priced deployment."""
+    """{group: (input_per_token, output_per_token)} of each group's lowest-priced deployment
+    (lowest input + output per-token sum)."""
     import yaml
     data = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
     best: dict = {}
@@ -43,14 +77,28 @@ def cloud_prices(config_path: str) -> dict:
     return best
 
 
-def read_rows(path: str, since_ts: float) -> Iterable[dict]:
+def read_rows(path: str, since_ts: float, stats: Optional[dict] = None) -> Iterable[dict]:
+    """Yield ledger rows newer than since_ts. If `stats` is given it receives `read` and `skipped`
+    (unparseable, non-object or timestamp-less lines)."""
+    if stats is not None:
+        stats.setdefault("read", 0)
+        stats.setdefault("skipped", 0)
     with open(path, encoding="utf-8") as handle:
         for line in handle:
+            if not line.strip():
+                continue
             try:
                 row = json.loads(line)
-            except ValueError:
+                if not isinstance(row, dict):
+                    raise ValueError("not an object")
+                ts = float(row["ts"])
+            except (ValueError, KeyError, TypeError):
+                if stats is not None:
+                    stats["skipped"] += 1
                 continue
-            if isinstance(row, dict) and row.get("ts", 0) >= since_ts:
+            if stats is not None:
+                stats["read"] += 1
+            if ts >= since_ts:
                 yield row
 
 
@@ -61,20 +109,37 @@ def summarise(rows: Iterable[dict], prices: dict, include_internal: bool = True)
             continue
         groups[row.get("group") or "?"]["local" if row.get("local") else "cloud"][row.get("deployment") or "?"].append(row)
     out: dict = {}
-    slo_ok = float(os.environ.get("LOCI_LOCAL_SLO_SUCCESS", "0.98"))
-    slo_p95 = float(os.environ.get("LOCI_LOCAL_SLO_P95_S", "20"))
-    slo_min = int(os.environ.get("LOCI_LOCAL_SLO_MIN_CALLS", "50"))
+    slo_ok = _env_number("LOCI_LOCAL_SLO_SUCCESS", 0.98)
+    slo_p95 = _env_number("LOCI_LOCAL_SLO_P95_S", 20.0)
+    slo_min = _env_number("LOCI_LOCAL_SLO_MIN_CALLS", 50, int)
     for group, sides in groups.items():
         local_rows = [r for rs in sides["local"].values() for r in rs]
         cloud_rows = [r for rs in sides["cloud"].values() for r in rs]
-        p_in, p_out = prices.get(group, (0.0, 0.0))
-        counterfactual = sum(r.get("prompt_tokens", 0) * p_in + r.get("completion_tokens", 0) * p_out
-                             for r in local_rows if r.get("ok"))
-        local_ok = [r for r in local_rows if r.get("ok")]
+        local_ok = [r for r in local_rows if r.get("ok") and not r.get("empty_response")]
+        all_rows = local_rows + cloud_rows
+        prompt_total = sum(int(r.get("prompt_tokens") or 0) for r in all_rows)
+        cache_read = sum(int(r.get("cache_read_tokens") or 0) for r in all_rows)
+        cache_write = sum(int(r.get("cache_write_tokens") or 0) for r in all_rows)
+        price = prices.get(group)
+        if price is None:
+            counterfactual: Optional[float] = None
+        else:
+            counterfactual = sum(r.get("prompt_tokens", 0) * price[0] + r.get("completion_tokens", 0) * price[1]
+                                 for r in local_ok)
         success = (len(local_ok) / len(local_rows)) if local_rows else None
-        lat = [r.get("latency_s", 0.0) for r in local_ok]
+        lat = [r["latency_s"] for r in local_ok if isinstance(r.get("latency_s"), (int, float))]
         p95 = _pctl(lat, 0.95)
-        meets = bool(local_rows) and len(local_rows) >= slo_min and success >= slo_ok and p95 <= slo_p95
+        failing = []
+        if not local_rows:
+            failing.append("no local calls")
+        else:
+            if len(local_rows) < slo_min:
+                failing.append(f"only {len(local_rows)} local calls, need {slo_min}")
+            if success < slo_ok:
+                failing.append(f"success {success:.1%} below {slo_ok:.1%}")
+            if p95 > slo_p95:
+                failing.append(f"p95 {p95:.1f}s above {slo_p95:g}s")
+        meets = not failing
         out[group] = {
             "calls": len(local_rows) + len(cloud_rows),
             "local_calls": len(local_rows),
@@ -83,13 +148,16 @@ def summarise(rows: Iterable[dict], prices: dict, include_internal: bool = True)
             "local_p50_s": round(_pctl(lat, 0.5), 2),
             "local_p95_s": round(p95, 2),
             "cloud_spend_usd": round(sum(r.get("cost_usd", 0.0) for r in cloud_rows), 6),
-            "local_savings_usd": round(counterfactual, 6),
+            "local_savings_usd": None if counterfactual is None else round(counterfactual, 6),
             "local_failures": sorted({r.get("error_class") or "?" for r in local_rows if not r.get("ok")}),
+            "empty_responses": sum(1 for r in all_rows if r.get("empty_response")),
+            "local_empty_responses": sum(1 for r in local_rows if r.get("empty_response")),
+            "prompt_tokens": prompt_total,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cache_read_share": None if not prompt_total else round(cache_read / prompt_total, 4),
             "meets_slo": meets,
-            "recommendation": (
-                "local is reliable: put it first (order below the cloud deployments)" if meets else
-                "keep cloud first" + ("" if len(local_rows) >= slo_min else f" (only {len(local_rows)} local calls, need {slo_min})")
-                if local_rows or cloud_rows else ""),
+            "recommendation": "local meets the SLO" if meets else "local does not meet the SLO: " + "; ".join(failing),
         }
     return out
 
@@ -99,25 +167,45 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--config", required=True, help="the LiteLLM config.yaml (for per-deployment prices)")
     ap.add_argument("--ledger", default="")
     ap.add_argument("--since-hours", type=float, default=24.0)
+    ap.add_argument("--exclude-internal", action="store_true",
+                    help="leave out calls the memory system flags as internal (judges, classifiers, embeddings)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    from loci_litellm.cost_ledger import ledger_path
+    from loci_litellm.backend_resolver import ledger_path   # LiteLLM-free: the report runs offline
     path = args.ledger or ledger_path()
     if not os.path.exists(path):
         print(f"no ledger at {path}", file=sys.stderr)
         return 2
-    summary = summarise(read_rows(path, time.time() - args.since_hours * 3600), cloud_prices(args.config))
+    stats: dict = {}
+    prices = cloud_prices(args.config)
+    summary = summarise(read_rows(path, time.time() - args.since_hours * 3600, stats), prices,
+                        include_internal=not args.exclude_internal)
+    if stats.get("skipped"):
+        print(f"warning: skipped {stats['skipped']} unreadable ledger line(s) of "
+              f"{stats['skipped'] + stats['read']} in {path}", file=sys.stderr)
+    unpriced = sorted(g for g in summary if g not in prices)
+    if unpriced:
+        print("warning: no priced deployment in the config for group(s): " + ", ".join(unpriced)
+              + " (savings shown as n/a)", file=sys.stderr)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
-    print(f"{'group':16s} {'calls':>6s} {'local':>6s} {'ok%':>6s} {'p95s':>6s} {'cloud$':>9s} {'saved$':>9s}  recommendation")
+    mode = "internal calls excluded" if args.exclude_internal else "internal calls included"
+    print(f"ledger {path}: {stats.get('read', 0)} rows read, {mode}; latency over successful local calls only; "
+          f"savings priced at the lowest-priced deployment per group")
+    print(f"{'group':16s} {'calls':>6s} {'local':>6s} {'ok%':>6s} {'empty':>6s} {'cache%':>7s} {'p95s':>6s} "
+          f"{'cloud$':>9s} {'saved$':>9s}  verdict")
     for group, s in sorted(summary.items()):
         ok = "-" if s["local_success"] is None else f"{100 * s['local_success']:.1f}"
-        print(f"{group:16s} {s['calls']:6d} {s['local_calls']:6d} {ok:>6s} {s['local_p95_s']:6.1f} "
-              f"{s['cloud_spend_usd']:9.4f} {s['local_savings_usd']:9.4f}  {s['recommendation']}")
-    total_saved = sum(s["local_savings_usd"] for s in summary.values())
+        saved = "n/a" if s["local_savings_usd"] is None else f"{s['local_savings_usd']:.4f}"
+        cache = "-" if s["cache_read_share"] is None else f"{100 * s['cache_read_share']:.1f}"
+        print(f"{group:16s} {s['calls']:6d} {s['local_calls']:6d} {ok:>6s} {s['empty_responses']:6d} {cache:>7s} "
+              f"{s['local_p95_s']:6.1f} {s['cloud_spend_usd']:9.4f} {saved:>9s}  {s['recommendation']}")
+    total_saved = sum(s["local_savings_usd"] or 0.0 for s in summary.values())
     total_spend = sum(s["cloud_spend_usd"] for s in summary.values())
-    print(f"\ncloud spend ${total_spend:.4f}, saved by local ${total_saved:.4f} over the last {args.since_hours:g} h")
+    note = " (groups without a price excluded)" if unpriced else ""
+    print(f"\ncloud spend ${total_spend:.4f}, saved by local ${total_saved:.4f}{note} over the last "
+          f"{args.since_hours:g} h")
     return 0
 
 

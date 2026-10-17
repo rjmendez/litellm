@@ -1,10 +1,4 @@
-import sys
-from pathlib import Path
-
-_plugin_root = Path(__file__).resolve().parents[3] / "litellm-loci"
-if _plugin_root.exists() and str(_plugin_root) not in sys.path:
-    sys.path.insert(0, str(_plugin_root))
-
+"""Re-export of loci_litellm.capability_gate (see litellm/integrations/loci/__init__.py)."""
 from loci_litellm.capability_gate import LociCapabilityGate, loci_capability_gate
 
 __all__ = ["LociCapabilityGate", "loci_capability_gate"]

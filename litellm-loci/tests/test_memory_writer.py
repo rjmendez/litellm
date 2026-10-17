@@ -222,7 +222,8 @@ async def test_investigation_id_in_payload(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_stores_reasoning_only_response(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_reasoning_only_response_is_not_stored_as_an_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Formerly asserted the false claim that chain of thought is the stored answer.
     monkeypatch.setenv("LOCI_OLLAMA_BASE_URL", "http://ollama.local")
     monkeypatch.setenv("LOCI_QDRANT_URL", "http://qdrant.local")
     monkeypatch.setenv("LOCI_MEM_MIN_PROMPT_LEN", "20")
@@ -238,7 +239,4 @@ async def test_stores_reasoning_only_response(monkeypatch: pytest.MonkeyPatch) -
         0.0,
     )
 
-    qdrant_calls = [call for call in client.calls if call["method"] == "PUT"]
-    assert len(qdrant_calls) == 1
-    payload = qdrant_calls[0]["kwargs"]["json"]["points"][0]["payload"]
-    assert reasoning[:500] in payload["text"]
+    assert client.calls == []

@@ -6,19 +6,29 @@ this integration depends on. Exit 0 = clean, 1 = violations.
 
 Invariants (each exists because it regressed or was found missing in production):
 
-  embedding-group     a pinned embedding group exists, is not in any fallback chain and is
-                      not a tier of the auto-router: vectors from different embedders are
-                      not comparable, so a failure must surface instead of falling back.
-  priced              every non-local deployment is priced: it declares input_cost_per_token
-                      and output_cost_per_token, or LiteLLM's built-in cost map knows the
-                      model. Otherwise spend is silently logged as $0.
-  no-ip-literal       no api_base and no *_URL / *_BASE variable points at an IP address.
-                      Consumers use DNS names (and TLS); loopback IPs are fine only for
-                      listener binds, which are not URLs and are not checked here.
+  embedding-group     a model group with the embedding name exists, does not appear in
+                      router_settings.fallbacks / context_window_fallbacks /
+                      content_policy_fallbacks, and is not a tier of a deployment's
+                      complexity_router_config. Not checked: litellm_settings.fallbacks,
+                      default_fallbacks, or the embedding group as an alias target.
+  priced              every deployment not exempted below is priced: it declares
+                      input_cost_per_token and output_cost_per_token, or LiteLLM's built-in
+                      cost map knows the model. Exempt: the embedding group, auto-router
+                      deployments, and any deployment whose api_base is `os.environ/NAME`
+                      with NAME starting OLLAMA, VLLM or LLAMA (the exemption is decided by
+                      that variable NAME only; the checker does not look at where it points).
+  no-ip-literal       no literal api_base is an IP address, and (only when --env is given)
+                      no env variable named *_URL/_BASE/_BASE_URL/_ENDPOINT/_HOST, and no
+                      variable referenced as an api_base through os.environ/NAME, holds an
+                      IP address. Variables whose name contains BIND or LISTEN are skipped.
   alias-targets       every model_group_alias target is a real model group.
   trusted-proxies     general_settings.trusted_proxy_ranges is set (warning only).
 
-Stdlib plus PyYAML (already a LiteLLM dependency).
+Without --env the environment half of no-ip-literal is not evaluated, and a NOTE line
+says so. The checker validates generic proxy hygiene only; it does not check that any
+callback is registered or that any LOCI_* setting exists.
+
+Stdlib plus PyYAML.
 """
 from __future__ import annotations
 
@@ -34,8 +44,8 @@ import yaml
 ENV_REF = re.compile(r"^os\.environ/(?P<name>[A-Za-z_][A-Za-z0-9_]*)$")
 URL_VAR = re.compile(r"(_URL|_BASE|_BASE_URL|_ENDPOINT|_HOST)$")
 BIND_VAR = re.compile(r"(BIND|LISTEN)", re.I)
-# Deployments whose cost is not per-token billing (local models) are identified by the
-# env var their api_base reads, which is how this deployment names its local endpoint.
+# Deployments are treated as local (exempt from `priced`) when their api_base is
+# `os.environ/NAME` and NAME matches this pattern. This is a naming convention, nothing more.
 LOCAL_BASE_ENV = re.compile(r"^(OLLAMA|VLLM|LLAMA)[A-Z_]*$")
 
 
@@ -127,8 +137,15 @@ def check(config: dict, env: dict[str, str] | None = None, embedding_group: str 
         if isinstance(base, str) and not ENV_REF.match(base) and _host_is_ip(base):
             violations.append(f"no-ip-literal: {d.get('model_name')} api_base is an IP address: {base}")
     # no-ip-literal (env)
+    referenced: set[str] = set()
+    for d in deployments:
+        base = (d.get("litellm_params") or {}).get("api_base")
+        m = ENV_REF.match(base) if isinstance(base, str) else None
+        if m:
+            referenced.add(m.group("name"))
     for key, value in (env or {}).items():
-        if URL_VAR.search(key) and not BIND_VAR.search(key) and _host_is_ip(value):
+        by_name = URL_VAR.search(key) and not BIND_VAR.search(key)
+        if (by_name or key in referenced) and _host_is_ip(value):
             violations.append(f"no-ip-literal: {key} points at an IP address ({value}); use the DNS name")
 
     # alias-targets
@@ -152,6 +169,8 @@ def main(argv=None) -> int:
     config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
     env = load_env(args.env) if args.env else None
     violations, warnings = check(config, env, args.embedding_group)
+    if env is None:
+        print("NOTE  --env not given: environment variables were not checked for IP addresses")
     for w in warnings:
         print(f"WARN  {w}")
     for v in violations:

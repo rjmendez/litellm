@@ -1,18 +1,28 @@
 """
-BackendResolver — portable backend resolution for the Loci integration.
+BackendResolver - backend resolution for the Loci integration, so a LiteLLM install carries no
+machine-specific endpoint or key in code.
 
-Ported from Loci's mcp/backends.py. Lets a LiteLLM install work UNCHANGED on
-any machine without hardcoding infra — a laptop uses its own local GPU, a
-headless box falls back to shared infra over tailscale — and keeps every
-machine-specific endpoint/key OUT of the codebase.
+Resolution order, per backend (this is the actual order; it differs between backends):
+  - Ollama embedding URL (ollama_url): env LOCI_OLLAMA_BASE_URL / OLLAMA_BASE_URL, then a TCP probe of
+    LOCI_LOCAL_OLLAMA (default http://localhost:11434), then `[ollama] url` in the config file, else ''.
+  - Embeddings API base (embed_api_base): ollama_url() + "/v1"; only when that is empty,
+    MNEMOSYNE_EMBEDDING_API_URL (already a full /v1 endpoint). So a reachable local Ollama wins over
+    MNEMOSYNE_EMBEDDING_API_URL.
+  - Embedding model: LOCI_EMBED_MODEL, MNEMOSYNE_EMBEDDING_MODEL, `[embed] model`, "nomic-embed-text".
+  - Qdrant: LOCI_QDRANT_URL / QDRANT_URL then `[qdrant] url`; key LOCI_QDRANT_API_KEY / QDRANT_API_KEY
+    then `[qdrant] api_key`; else ''.
+  - Other settings: env, then config file, then default.
 
-Resolution chain per backend:
-  1. explicit env var — power-user override
-  2. a LOCAL probe (e.g. localhost:11434 for Ollama) — laptop auto-uses its own hardware
-  3. a gitignored config file — remote infra (GPU host, Qdrant key)
-  4. a safe default / empty — the tiers already fail-open when a backend is empty
+Config file: $LOCI_CONFIG, else ~/.loci/backends.toml (TOML). The path, LOCI_LOCAL_OLLAMA and the file
+contents are read once per process: changing them later has no effect until restart (tests clear
+_config.cache_clear()).
 
-Config file: $LOCI_CONFIG, else ~/.loci/backends.toml. TOML (stdlib tomllib).
+Fail-open, loudly: an unreadable or unparseable config file yields an empty config for the life of the
+process and a WARNING naming the path and the error (also when LOCI_CONFIG points at a missing file).
+config_load_error() returns that reason (or ''), so callers can surface it. A config section that is
+not a table is ignored with a WARNING. Most methods read the environment on every call; only ollama_url
+is memoized (per probe_timeout), so its first answer, including "no Ollama reachable", is kept until
+restart and its env var is frozen at first call.
 """
 
 from __future__ import annotations
@@ -30,25 +40,47 @@ logger = logging.getLogger("loci_litellm.backends")
 _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "backends.toml")
 
 _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
-_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:18000")
-_OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
+
+_config_error = ""
+
+
+def config_load_error() -> str:
+    """Why the private config is not in effect ('' when it loaded, or none exists at the default path)."""
+    return _config_error
 
 
 @functools.lru_cache(maxsize=1)
 def _config() -> dict:
-    """Parse the gitignored TOML config. Fail-open: missing/broken file -> {}."""
+    """Parse the private TOML config. Fail-open to {} - with a WARNING and config_load_error() set."""
+    global _config_error
+    _config_error = ""
+    p = Path(_CONFIG_PATH)
     try:
         import tomllib
-        p = Path(_CONFIG_PATH)
         if p.exists():
-            return tomllib.loads(p.read_text())
+            return tomllib.loads(p.read_text(encoding="utf-8"))
+        if os.environ.get("LOCI_CONFIG"):
+            _config_error = f"LOCI_CONFIG points at a missing file: {p}"
     except Exception as exc:
-        logger.debug("loci backends: _config fail-open: %r", exc)
+        _config_error = f"could not read/parse {p}: {exc!r}"
+    if _config_error:
+        logger.warning("loci backends: running with an EMPTY config (defaults only): %s", _config_error)
     return {}
 
 
+_warned_sections: set = set()
+
+
 def _cfg(section: str, key: str, default=None):
-    return (_config().get(section) or {}).get(key, default)
+    value = _config().get(section)
+    if value is None:
+        return default
+    if not isinstance(value, dict):
+        if section not in _warned_sections:
+            _warned_sections.add(section)
+            logger.warning("loci backends: config section [%s] is not a table; ignored", section)
+        return default
+    return value.get(key, default)
 
 
 def _alive(url: str, timeout: float = 1.0) -> bool:
@@ -69,18 +101,18 @@ def _alive(url: str, timeout: float = 1.0) -> bool:
 
 class BackendResolver:
     """
-    Portable backend resolution ported from Loci's backends.py.
+    Backend resolution (see the module docstring for the per-backend order).
 
-    All methods are memoized — the probe runs once per process lifetime.
-    Fail-open: every method returns '' or a safe default, never raises.
+    Methods return '' or a default rather than raising. Only ollama_url is memoized.
     """
 
     @staticmethod
     @functools.lru_cache(maxsize=8)
     def ollama_url(probe_timeout: float = 1.0) -> str:
-        """Ollama base URL: env -> local probe -> config -> ''.
+        """Ollama embedding base URL: env -> TCP probe of LOCI_LOCAL_OLLAMA -> config -> ''.
 
-        This is the EMBEDDING endpoint. Generation may live on a different host.
+        Memoized per probe_timeout: the first result, including '' (nothing reachable), is kept for
+        the process lifetime, so an Ollama started later is not picked up until restart.
         """
         env = os.environ.get("LOCI_OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL")
         if env:
@@ -90,60 +122,10 @@ class BackendResolver:
         return _cfg("ollama", "url", "") or ""
 
     @staticmethod
-    @functools.lru_cache(maxsize=8)
-    def ollama_gen_url(probe_timeout: float = 1.0) -> str:
-        """Ollama GENERATION endpoint — resolved separately from the embedding one.
-
-        A shared/cluster Ollama may serve embeddings only, while your own GPU
-        box serves generation with a richer model library.
-        """
-        env = (os.environ.get("LOCI_OLLAMA_GEN_URL")
-               or os.environ.get("OLLAMA_GEN_URL") or "")
-        if env:
-            return env
-        configured = _cfg("ollama", "gen_url", "") or ""
-        if configured:
-            return configured
-        return BackendResolver.ollama_url(probe_timeout)
-
-    @staticmethod
-    def ollama_gen_model() -> str:
-        """Generation model tag. Env -> config -> safe default."""
-        env_or_cfg = (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
-                      or _cfg("ollama", "gen_model", ""))
-        return env_or_cfg or "qwen2.5:3b"
-
-    @staticmethod
     def embed_model() -> str:
         return (os.environ.get("LOCI_EMBED_MODEL")
                 or os.environ.get("MNEMOSYNE_EMBEDDING_MODEL")
                 or _cfg("embed", "model", "nomic-embed-text"))
-
-    @staticmethod
-    @functools.lru_cache(maxsize=8)
-    def vllm_url(probe_timeout: float = 1.0) -> str:
-        """vLLM/OpenAI base URL: env -> config -> local probe -> ''."""
-        env = os.environ.get("LOCI_VLLM_BASE_URL") or os.environ.get("VLLM_BASE_URL")
-        if env:
-            return env
-        configured = _cfg("vllm", "url", "") or ""
-        if configured:
-            return configured
-        if _alive(_LOCAL_VLLM, timeout=probe_timeout):
-            return _LOCAL_VLLM
-        return ""
-
-    @staticmethod
-    def vllm_model() -> str:
-        return (os.environ.get("LOCI_VLLM_MODEL")
-                or os.environ.get("VLLM_MODEL")
-                or _cfg("vllm", "model", "Qwen2.5-3B-Instruct"))
-
-    @staticmethod
-    def rerank_model() -> str:
-        return (os.environ.get("LOCI_RERANK_MODEL")
-                or os.environ.get("RERANK_MODEL")
-                or _cfg("rerank", "model", "BAAI/bge-reranker-v2-m3"))
 
     @staticmethod
     def qdrant() -> Tuple[str, str]:
@@ -168,8 +150,8 @@ class BackendResolver:
     def embed_api_base() -> Optional[str]:
         """OpenAI-compatible embeddings base URL.
 
-        OLLAMA_BASE_URL is a bare host and needs /v1 appended;
-        MNEMOSYNE_EMBEDDING_API_URL is already a full /v1 endpoint.
+        ollama_url() (env, local probe, config) + /v1 wins; only when it is empty is
+        MNEMOSYNE_EMBEDDING_API_URL (already a full /v1 endpoint) used.
         """
         base = BackendResolver.ollama_url()
         if base:
@@ -187,6 +169,12 @@ class BackendResolver:
     def is_disabled() -> bool:
         """Check if the Loci integration is explicitly disabled."""
         return os.environ.get("LOCI_GROUNDING_DISABLED", "").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def cost_ledger_file() -> str:
+        """`[cost] ledger_file` from the private config ('' when unset). LOCI_COST_LEDGER_FILE is
+        handled by cost_ledger.ledger_path()."""
+        return str(_cfg("cost", "ledger_file", "") or "")
 
     @staticmethod
     def grounding_audit_file() -> str:
@@ -230,3 +218,10 @@ class BackendResolver:
     @staticmethod
     def pheromone_deposit_disabled() -> bool:
         return os.environ.get("LOCI_PHERO_DEPOSIT_DISABLED", "").lower() in ("1", "true", "yes", "on")
+
+def ledger_path() -> str:
+    """Where the cost ledger lives: LOCI_COST_LEDGER_FILE, else `[cost] ledger_file` in the private config,
+    else ~/.loci/litellm_cost_ledger.jsonl. Here (not in cost_ledger) so the offline report can resolve it
+    without importing LiteLLM."""
+    explicit = os.environ.get("LOCI_COST_LEDGER_FILE") or BackendResolver.cost_ledger_file()
+    return str(explicit or (Path.home() / ".loci" / "litellm_cost_ledger.jsonl"))

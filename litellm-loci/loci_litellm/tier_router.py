@@ -1,22 +1,24 @@
 """
-LociTierRouter — fail-open tiered model routing for LiteLLM proxy.
+LociTierRouter - an advisory per-model-group circuit breaker for the LiteLLM proxy.
 
-Ported from Loci's mcp/llm_local.py and backends.py. Provides a CustomLogger
-callback that monitors LLM calls and routes failures through Loci's fail-open
-discipline:
+What it does:
+  - Observes LiteLLM's async success and failure log events, keyed by model group
+    (falling back to the requested model name).
+  - Counts CONSECUTIVE transient failures (timeouts, connection errors, HTTP 408 / 5xx) per group; a
+    success resets the count. Permanent errors (auth, bad request, model not found) are not counted and
+    are logged at INFO with their class.
+  - When a group reaches LOCI_CB_FAILURE_THRESHOLD (default 5) its circuit opens and a WARNING is logged.
+    Backoff is a fixed 1, 2, 4 ... 64 s sequence; it is not configurable.
+  - In async_pre_call_hook, if a known group's circuit is open it logs a WARNING and sets
+    metadata["loci_circuit_open"] = <group> on the request.
 
-  - Every op fails open: on timeout / HTTP error / bad response, return a
-    well-formed degraded result and NEVER raise.
-  - Transient transport errors (timeout, connection reset, bad gateway)
-    are distinguished from permanent failures (auth, model not found).
-  - Route metadata (backend, route, model, latency_ms, tier) is attached to
-    every response for observability.
-  - Per-provider circuit breaker with exponential backoff, ported from
-    Loci's circuit_breaker.py design.
-
-This complements but does not replace LiteLLM's built-in router. It hooks
-into async_post_call_failure_hook to record failures and async_pre_call_hook
-to check circuit state and optionally redirect to a healthy provider.
+What it does NOT do:
+  - It never blocks, redirects or reorders a request: async_pre_call_hook always returns None, and
+    LiteLLM's own router decides where the call goes.
+  - Nothing in this package reads the loci_circuit_open tag, and get_status() has no endpoint. The
+    operator-visible signal is the log lines from the "loci_litellm.tier_router" logger.
+  - State is per process (per worker) and in memory; it is lost on restart.
+  - Only the async log events are observed; calls LiteLLM logs through its sync path are not.
 
 Register in litellm config.yaml:
     litellm_settings:
@@ -26,23 +28,20 @@ Register in litellm config.yaml:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import threading
 import time
-from collections import defaultdict
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("loci_litellm.tier_router")
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
+# consecutive transient failures (no success in between, at any time gap) before a circuit opens
 _FAILURE_THRESHOLD = int(os.environ.get("LOCI_CB_FAILURE_THRESHOLD", "5"))
-_RECOVERY_WINDOW_S = int(os.environ.get("LOCI_CB_RECOVERY_WINDOW", "60"))
 _BACKOFF_SEQUENCE = [1, 2, 4, 8, 16, 32, 64]  # seconds
 
 
@@ -98,12 +97,12 @@ class ProviderHealth:
         self.backoff_level = min(self.backoff_level + 1, len(_BACKOFF_SEQUENCE) - 1)
         self.backoff_until = time.time() + delay
         logger.warning(
-            "loci tier_router: %s circuit OPENED after %d failures, backoff %ds",
+            "loci tier_router: %s circuit OPENED after %d consecutive transient failures, backoff %ds",
             self.name, self.failure_count, delay,
         )
 
     def can_proceed(self) -> bool:
-        """Check if requests should be allowed through."""
+        """Whether the circuit is not currently open. Informational: callers do not block on it."""
         with self.lock:
             if self.state == CircuitState.CLOSED:
                 return True
@@ -114,7 +113,8 @@ class ProviderHealth:
                     logger.info("loci tier_router: %s half_open (testing recovery)", self.name)
                     return True
                 return False
-            # HALF_OPEN: allow one test request
+            # HALF_OPEN: there is no single-probe slot; every request passes, and any
+            # transient failure while half-open re-opens the circuit with a longer backoff.
             return True
 
     def status(self) -> dict:
@@ -131,31 +131,42 @@ class ProviderHealth:
             }
 
 
-def _is_transient(exc: Exception) -> bool:
-    """Classify whether an exception is a transient transport error."""
+_TRANSIENT_CLASS_NAMES = (
+    "serviceunavailableerror", "badgatewayerror", "internalservererror", "apiconnectionerror",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Classify whether an exception is a transient provider/transport failure.
+
+    Order: HTTP status (408, >= 500 transient; other 4xx not), then class name
+    (timeout/connection/known litellm classes), then message substrings.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status == 408 or status >= 500:
+            return True
+        if 400 <= status < 500:
+            return False
     name = type(exc).__name__.lower()
+    if "timeout" in name or "connection" in name or name in _TRANSIENT_CLASS_NAMES:
+        return True
     msg = str(exc).lower()
     signals = (
-        "timeout", "temporar", "connection aborted", "connection reset",
-        "connection refused", "service unavailable", "bad gateway",
-        "gateway timeout",
+        "timeout", "timed out", "temporar", "connection aborted", "connection reset",
+        "connection refused", "service unavailable", "bad gateway", "gateway timeout",
     )
-    if "timeout" in name or "connection" in name:
-        return True
     return any(s in msg for s in signals)
 
 
 class LociTierRouter(CustomLogger):
     """
-    LiteLLM CustomLogger that provides fail-open tiered routing with
-    per-provider circuit breaking.
+    Advisory per-model-group circuit breaker (see the module docstring).
 
-    Fail-open discipline:
-    - On any error, record it and let the request proceed to the next
-      provider in LiteLLM's router fallback chain.
-    - Never raise from a hook — raising would break the proxy.
-    - Circuit state is advisory: it logs and tags, it doesn't hard-block
-      (LiteLLM's own router handles fallback).
+    - Circuit state only logs and tags request metadata; it never blocks or redirects.
+    - The hooks catch their own exceptions and log a WARNING, so a malformed payload cannot
+      break the proxy. A swallowed error means that event was not counted.
+    - State is per process.
     """
 
     def __init__(self) -> None:
@@ -183,24 +194,26 @@ class LociTierRouter(CustomLogger):
         call_type: Any,
     ) -> Exception | str | dict | None:
         """Check circuit state before the call. Advisory only — does not block."""
-        provider = self._circuit_key(data)
-        if provider == "unknown":
-            return None
-
-        with self._lock:
-            health = self._providers.setdefault(provider, ProviderHealth(provider))
-
-        if not health.can_proceed():
-            # Log but don't block — let LiteLLM's router handle fallback
-            logger.warning(
-                "loci tier_router: %s circuit open, request proceeding to fallback",
-                provider,
-            )
-            # Tag metadata for observability
-            metadata = data.get("metadata") or {}
-            metadata["loci_circuit_open"] = provider
-            data["metadata"] = metadata
-
+        try:
+            provider = self._circuit_key(data)
+            if provider == "unknown":
+                return None
+            # Read only: entries are created from success/failure events (router model groups), never
+            # from client-supplied model strings, so arbitrary model names cannot grow the table.
+            with self._lock:
+                health = self._providers.get(provider)
+            if health is not None and not health.can_proceed():
+                logger.warning(
+                    "loci tier_router: %s circuit open; request proceeds unchanged (advisory only)",
+                    provider,
+                )
+                metadata = data.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["loci_circuit_open"] = provider
+                data["metadata"] = metadata
+        except Exception as exc:
+            logger.warning("loci tier_router: pre_call check failed, request unaffected: %r", exc)
         return None
 
     async def async_log_success_event(
@@ -211,12 +224,15 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record success on the provider."""
-        provider = self._circuit_key(kwargs)
-        if provider == "unknown":
-            return
-        with self._lock:
-            health = self._providers.setdefault(provider, ProviderHealth(provider))
-        health.record_success()
+        try:
+            provider = self._circuit_key(kwargs)
+            if provider == "unknown":
+                return
+            with self._lock:
+                health = self._providers.setdefault(provider, ProviderHealth(provider))
+            health.record_success()
+        except Exception as exc:
+            logger.warning("loci tier_router: could not record a success event: %r", exc)
 
     async def async_log_failure_event(
         self,
@@ -226,33 +242,31 @@ class LociTierRouter(CustomLogger):
         end_time: float,
     ) -> None:
         """Record failure on the provider, classify transient vs permanent."""
-        provider = self._circuit_key(kwargs)
-        if provider == "unknown":
-            return
-
-        # Extract the original exception
-        exc = kwargs.get("original_exception") or kwargs.get("exception")
-        is_transient = False
-        if exc and isinstance(exc, Exception):
-            is_transient = _is_transient(exc)
-
-        with self._lock:
-            health = self._providers.setdefault(provider, ProviderHealth(provider))
-        # errors (auth, model not found) are config issues, not provider health
-        if is_transient:
-            health.record_failure()
-            logger.debug(
-                "loci tier_router: %s transient failure recorded (%d/%d)",
-                provider, health.failure_count, _FAILURE_THRESHOLD,
-            )
-        else:
-            logger.debug(
-                "loci tier_router: %s permanent error (not counted): %r",
-                provider, exc,
-            )
+        try:
+            provider = self._circuit_key(kwargs)
+            if provider == "unknown":
+                return
+            exc = kwargs.get("original_exception") or kwargs.get("exception")
+            is_transient = isinstance(exc, BaseException) and _is_transient(exc)
+            with self._lock:
+                health = self._providers.setdefault(provider, ProviderHealth(provider))
+            if is_transient:
+                health.record_failure()
+                logger.debug(
+                    "loci tier_router: %s transient failure recorded (%d/%d consecutive)",
+                    provider, health.failure_count, _FAILURE_THRESHOLD,
+                )
+            else:
+                # config-type errors (auth, model not found) say nothing about provider health
+                logger.info(
+                    "loci tier_router: %s failure not counted toward the circuit (%s)",
+                    provider, type(exc).__name__ if exc is not None else "no exception on the event",
+                )
+        except Exception as err:
+            logger.warning("loci tier_router: could not record a failure event: %r", err)
 
     def get_status(self) -> dict:
-        """Return circuit breaker status for all known providers."""
+        """Circuit status per model group seen in events. In-process only; no endpoint exposes it."""
         with self._lock:
             return {
                 name: health.status()
