@@ -28,7 +28,8 @@ import time
 import threading
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Any, Optional, Dict, List
+from pathlib import Path
+from typing import Any, Final, Optional, Dict, List
 from datetime import datetime, timedelta
 
 from litellm._logging import verbose_logger
@@ -60,11 +61,11 @@ DRPG_REFINEMENT_INTERVAL = _get_policy_config()["drpg_interval"]
 
 
 class PolicyViolationType(Enum):
-    """Types of policy violations detected."""
     MODEL_NOT_ALLOWED = "model_not_allowed"
     MAX_CHARS_EXCEEDED = "max_chars_exceeded"
     RESERVED_COLLECTION = "reserved_collection_access"
     MALFORMED_INTENT = "malformed_intent"
+    TOOL_NOT_ALLOWED = "tool_not_allowed"
 
 
 @dataclass
@@ -293,6 +294,26 @@ class LociPolicyHook(CustomLogger):
                     self.state.record_violation(violation)
                     logger.warning(f"Policy violation: {violation.message}")
         
+            # Check tool allowlist
+            allowed_tools_raw: Final = os.environ.get("LOCI_POLICY_ALLOWED_TOOLS", "")
+            if allowed_tools_raw:
+                allowed_tools: Final = frozenset(
+                    t.strip() for t in allowed_tools_raw.split(",") if t.strip()
+                )
+                for tool in data.get("tools") or []:
+                    if not isinstance(tool, dict):
+                        continue
+                    tool_name: Final = (tool.get("function") or {}).get("name", "")
+                    if tool_name and tool_name not in allowed_tools:
+                        tool_violation = PolicyViolation(
+                            violation_type=PolicyViolationType.TOOL_NOT_ALLOWED,
+                            message=f"Tool '{tool_name}' not in allowed tools: {sorted(allowed_tools)}",
+                            request_id=data.get("request_id"),
+                        )
+                        violations.append(tool_violation)
+                        self.state.record_violation(tool_violation)
+                        logger.warning(f"Policy violation: {tool_violation.message}")
+        
             # Block if requested and violations found
             if violations and config["block_violations"]:
                 raise Exception(
@@ -364,6 +385,106 @@ class LociPolicyHook(CustomLogger):
         except Exception:
             pass
         return 0.0
+
+    def get_trajectory_path(self, policy_id: str) -> Path:
+        trajectory_dir: Final = Path(
+            os.environ.get("LOCI_TRAJECTORY_DIR", "~/.loci/trajectories")
+        ).expanduser()
+        return trajectory_dir / f"{policy_id}.jsonl"
+
+    def _response_time_ms(self, start_time: Any, end_time: Any) -> float:
+        if isinstance(start_time, datetime) and isinstance(end_time, datetime):
+            return (end_time - start_time).total_seconds() * 1000
+        if isinstance(start_time, (int, float)) and isinstance(end_time, (int, float)):
+            return float((end_time - start_time) * 1000)
+        return 0.0
+
+    def _extract_content_from_response(self, response_obj: Any) -> str:
+        try:
+            choices = getattr(response_obj, "choices", None)
+            if choices:
+                return getattr(choices[0].message, "content", "") or ""
+        except Exception:
+            pass
+        return ""
+
+    def _extract_prompt_tokens(self, response_obj: Any, kwargs: dict[str, Any]) -> int:
+        try:
+            usage = getattr(response_obj, "usage", None)
+            if usage:
+                return int(getattr(usage, "prompt_tokens", 0) or 0)
+        except Exception:
+            pass
+        raw_usage = kwargs.get("usage")
+        if isinstance(raw_usage, dict):
+            return int(raw_usage.get("prompt_tokens", 0) or 0)
+        return 0
+
+    def _build_trajectory_step(
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+        r_cor: float,
+    ) -> dict[str, Any]:
+        response_time: Final = self._response_time_ms(start_time, end_time)
+        prompt_tokens: Final = self._extract_prompt_tokens(response_obj, kwargs)
+        content: Final = self._extract_content_from_response(response_obj)
+
+        reward: Final = EvoRagRewardTensor(
+            r_ret=1.0 if content else 0.0,
+            r_ovp=-0.1 * (prompt_tokens / 1000) if prompt_tokens > 1000 else 0.0,
+            r_step=-0.01 * response_time / 100,
+            r_cor=r_cor,
+        )
+
+        return {
+            "timestamp": time.time(),
+            "policy_id": (
+                (kwargs.get("metadata") or {}).get("policy_id")
+                or kwargs.get("model", "default")
+                or "default"
+            ),
+            "model": kwargs.get("model", "unknown"),
+            "prompt_tokens": prompt_tokens,
+            "response_time_ms": response_time,
+            "reward": asdict(reward),
+        }
+
+    def _append_trajectory_step(self, policy_id: str, step: dict[str, Any]) -> None:
+        trajectory_path: Final = self.get_trajectory_path(policy_id)
+        trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(trajectory_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(step) + "\n")
+
+    async def async_log_success_event(
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+    ) -> None:
+        config: Final = _get_policy_config()
+        if not config["enabled"]:
+            return
+
+        step: Final = self._build_trajectory_step(kwargs, response_obj, start_time, end_time, r_cor=1.0)
+        self._append_trajectory_step(step["policy_id"], step)
+
+    async def async_log_failure_event(
+        self,
+        kwargs: dict[str, Any],
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+    ) -> None:
+        config: Final = _get_policy_config()
+        if not config["enabled"]:
+            return
+
+        step: Final = self._build_trajectory_step(kwargs, response_obj, start_time, end_time, r_cor=0.0)
+        self._append_trajectory_step(step["policy_id"], step)
 
 
 # Singleton instance for registration

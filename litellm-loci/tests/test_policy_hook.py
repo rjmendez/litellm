@@ -11,6 +11,7 @@ Tests cover:
 """
 
 import asyncio
+import json
 import os
 import pytest
 import time
@@ -505,6 +506,195 @@ class TestEnvHandling:
         assert "gpt-4" in policy_mod.POLICY_ALLOWED_MODELS
         assert "claude-3" in policy_mod.POLICY_ALLOWED_MODELS
         assert policy_mod.POLICY_BLOCK_VIOLATIONS is True
+
+
+class TestTrajectoryPersistence:
+    def _make_mock_response(self, content: str = "hello") -> Any:
+        msg = Mock()
+        msg.content = content
+        choice = Mock()
+        choice.message = msg
+        usage = Mock()
+        usage.prompt_tokens = 500
+        response = Mock()
+        response.choices = [choice]
+        response.usage = usage
+        return response
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"LOCI_POLICY_ENABLE": "1"})
+    async def test_trajectory_persistence(self, tmp_path):
+        hook = LociPolicyHook()
+        response = self._make_mock_response("test content")
+        kwargs = {"model": "gpt-4", "metadata": {"policy_id": "test-policy"}}
+
+        with patch.dict(os.environ, {"LOCI_TRAJECTORY_DIR": str(tmp_path)}):
+            await hook.async_log_success_event(kwargs, response, 0.0, 1.0)
+
+        trajectory_file = tmp_path / "test-policy.jsonl"
+        assert trajectory_file.exists(), "JSONL trajectory file not created"
+
+        lines = trajectory_file.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 1
+
+        step = json.loads(lines[0])
+        assert step["policy_id"] == "test-policy"
+        assert step["model"] == "gpt-4"
+        assert "reward" in step
+        assert "timestamp" in step
+        assert "prompt_tokens" in step
+        assert "response_time_ms" in step
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"LOCI_POLICY_ENABLE": "1"})
+    async def test_trajectory_appends_multiple_steps(self, tmp_path):
+        hook = LociPolicyHook()
+        response = self._make_mock_response("hello")
+        kwargs = {"model": "gpt-4"}
+
+        with patch.dict(os.environ, {"LOCI_TRAJECTORY_DIR": str(tmp_path)}):
+            await hook.async_log_success_event(kwargs, response, 0.0, 0.5)
+            await hook.async_log_success_event(kwargs, response, 0.0, 0.5)
+
+        trajectory_file = tmp_path / "gpt-4.jsonl"
+        lines = trajectory_file.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 2
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"LOCI_POLICY_ENABLE": "0"})
+    async def test_trajectory_skipped_when_disabled(self, tmp_path):
+        hook = LociPolicyHook()
+        response = self._make_mock_response()
+        kwargs = {"model": "gpt-4"}
+
+        with patch.dict(os.environ, {"LOCI_TRAJECTORY_DIR": str(tmp_path)}):
+            await hook.async_log_success_event(kwargs, response, 0.0, 0.5)
+
+        assert not any(tmp_path.iterdir()), "No file should be written when policy disabled"
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"LOCI_POLICY_ENABLE": "1"})
+    async def test_reward_tensor_from_call_data_success(self, tmp_path):
+        hook = LociPolicyHook()
+        response = self._make_mock_response("some response content")
+        kwargs = {"model": "my-model"}
+
+        with patch.dict(os.environ, {"LOCI_TRAJECTORY_DIR": str(tmp_path)}):
+            await hook.async_log_success_event(kwargs, response, 0.0, 0.2)
+
+        step = json.loads((tmp_path / "my-model.jsonl").read_text(encoding="utf-8"))
+        assert step["reward"]["r_cor"] == 1.0
+        assert step["reward"]["r_ret"] == 1.0
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"LOCI_POLICY_ENABLE": "1"})
+    async def test_reward_tensor_from_call_data_failure(self, tmp_path):
+        hook = LociPolicyHook()
+
+        empty_msg = Mock()
+        empty_msg.content = ""
+        choice = Mock()
+        choice.message = empty_msg
+        usage = Mock()
+        usage.prompt_tokens = 0
+        response = Mock()
+        response.choices = [choice]
+        response.usage = usage
+
+        kwargs = {"model": "my-model"}
+
+        with patch.dict(os.environ, {"LOCI_TRAJECTORY_DIR": str(tmp_path)}):
+            await hook.async_log_failure_event(kwargs, response, 0.0, 0.1)
+
+        step = json.loads((tmp_path / "my-model.jsonl").read_text(encoding="utf-8"))
+        assert step["reward"]["r_cor"] == 0.0
+        assert step["reward"]["r_ret"] == 0.0
+
+
+class TestToolCallEnforcement:
+    def _tool_request(self, *tool_names: str) -> dict:
+        return {
+            "model": "gpt-4",
+            "tools": [
+                {"function": {"name": name}, "type": "function"}
+                for name in tool_names
+            ],
+        }
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {
+        "LOCI_POLICY_ENABLE": "1",
+        "LOCI_POLICY_ALLOWED_TOOLS": "tool_a,tool_b",
+        "LOCI_POLICY_BLOCK_VIOLATIONS": "1",
+    })
+    async def test_tool_call_enforcement_blocked(self):
+        hook = LociPolicyHook()
+        hook.state = PolicyState()
+
+        with pytest.raises(Exception, match="tool_c"):
+            await hook.async_pre_call_hook("msg", self._tool_request("tool_c"), "completion")
+
+        assert any(
+            v.violation_type.value == "tool_not_allowed"
+            for v in hook.state.violations
+        )
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {
+        "LOCI_POLICY_ENABLE": "1",
+        "LOCI_POLICY_ALLOWED_TOOLS": "tool_a,tool_b",
+        "LOCI_POLICY_BLOCK_VIOLATIONS": "1",
+    })
+    async def test_tool_call_enforcement_allowed(self):
+        hook = LociPolicyHook()
+        hook.state = PolicyState()
+
+        result = await hook.async_pre_call_hook("msg", self._tool_request("tool_a"), "completion")
+
+        assert result is None
+        assert not any(
+            v.violation_type.value == "tool_not_allowed"
+            for v in hook.state.violations
+        )
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {
+        "LOCI_POLICY_ENABLE": "1",
+        "LOCI_POLICY_BLOCK_VIOLATIONS": "1",
+    }, clear=False)
+    async def test_tool_call_enforcement_disabled(self):
+        hook = LociPolicyHook()
+        hook.state = PolicyState()
+
+        env_without_tools = {k: v for k, v in os.environ.items() if k != "LOCI_POLICY_ALLOWED_TOOLS"}
+        with patch.dict(os.environ, env_without_tools, clear=True):
+            result = await hook.async_pre_call_hook(
+                "msg", self._tool_request("any_tool", "dangerous_tool"), "completion"
+            )
+
+        assert result is None
+        assert not any(
+            v.violation_type.value == "tool_not_allowed"
+            for v in hook.state.violations
+        )
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {
+        "LOCI_POLICY_ENABLE": "1",
+        "LOCI_POLICY_ALLOWED_TOOLS": "tool_a,tool_b",
+        "LOCI_POLICY_BLOCK_VIOLATIONS": "0",
+    })
+    async def test_tool_call_violation_logged_not_blocked_without_block_flag(self):
+        hook = LociPolicyHook()
+        hook.state = PolicyState()
+
+        result = await hook.async_pre_call_hook("msg", self._tool_request("tool_c"), "completion")
+
+        assert result is None
+        assert any(
+            v.violation_type.value == "tool_not_allowed"
+            for v in hook.state.violations
+        )
 
 
 if __name__ == "__main__":
