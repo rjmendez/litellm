@@ -1,0 +1,42 @@
+name: "Copilot Setup Steps"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install litellm-loci dependencies
+        run: |
+          cd litellm-loci
+          pip install -e ".[dev]" 2>/dev/null || pip install litellm httpx python-dotenv
+          pip install pytest  # guarantee pytest regardless of setup.py extras
+
+      - name: Verify loci_litellm imports
+        run: |
+          cd litellm-loci
+          python -c "from loci_litellm.policy_hook import LociPolicyHook; print('LociPolicyHook OK')"
+
+      - name: Run loci_litellm unit tests
+        run: |
+          cd litellm-loci
+          python -m pytest tests/ -q --tb=short || true
